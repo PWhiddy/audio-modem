@@ -20,7 +20,7 @@
 #define FLAG_MORE 1u
 #define SEARCH_MS 3000u
 #define IDLE_POLL_MS 1000u
-#define LINK_TIMEOUT_MS 12000u
+#define LINK_TIMEOUT_MS 30000u
 #define TURNAROUND_MS 250u
 #define OUTPUT_TAIL_MS 180u
 
@@ -143,7 +143,7 @@ static void usage(FILE *stream, const char *program)
         "  --gateway             share this machine's internet connection\n"
         "\n"
         "Options:\n"
-        "  --band LOW:HIGH       requested audio band in Hz (default 2000:8000)\n"
+        "  --band LOW:HIGH       requested audio band in Hz (default 2000:6000)\n"
         "  --input DEVICE        ALSA name or CoreAudio device UID\n"
         "  --output DEVICE       ALSA name or CoreAudio device UID\n"
         "  --no-config           create TUN/utun but do not alter routes or NAT\n"
@@ -373,7 +373,7 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
         app->sequence = 1;
         app->next_action = now;
         app->last_receive = now;
-        log_line(app, "link up (session %08x, QPSK OFDM, %u-%u Hz)",
+        log_line(app, "link up (session %08x, repeated-BPSK OFDM, %u-%u Hz)",
                  app->session, app->selected_low, app->selected_high);
         return;
     }
@@ -430,7 +430,7 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
         app->last_receive = now;
         app->cached_response_valid = 0;
         packet_receiver_init(&app->receiver);
-        log_line(app, "link up (session %08x, QPSK OFDM, %u-%u Hz)",
+        log_line(app, "link up (session %08x, repeated-BPSK OFDM, %u-%u Hz)",
                  app->session, app->selected_low, app->selected_high);
         return;
     }
@@ -772,7 +772,7 @@ static int run_app(const options_t *options)
     log_line(&app, "audio input:  %s", audio_input_name(app.audio));
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
     log_line(&app,
-             "audio format: mono 48 kHz; QPSK data, repeated-BPSK control; bootstrap band 2000-6000 Hz");
+             "audio format: mono 48 kHz; repeated-BPSK OFDM (control 4x, data 2x); bootstrap band 2000-6000 Hz");
     log_line(&app,
              "half-duplex timing: %u ms turnaround; local transmit echo suppressed",
              TURNAROUND_MS);

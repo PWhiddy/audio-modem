@@ -69,7 +69,7 @@ peaks near 0 dBFS because those indicate clipping.
 ```text
 --client              run as the client (default)
 --gateway             run as the internet gateway
---band LOW:HIGH       requested band in Hz (default 2000:8000)
+--band LOW:HIGH       requested band in Hz (default 2000:6000)
 --input DEVICE        ALSA device name or CoreAudio device UID
 --output DEVICE       ALSA device name or CoreAudio device UID
 --no-config           do not install addresses, routes, forwarding, or NAT
@@ -98,11 +98,12 @@ privileges.
 
 - 48 kHz mono audio, with active OFDM carriers inside the negotiated 2-12 kHz
   range.
-- QPSK (4-QAM) data carriers, BPSK pilots and training symbols, cyclic prefixes,
+- Repeated-BPSK data carriers, BPSK pilots and training symbols, cyclic prefixes,
   and per-burst channel/phase estimation. Pilot tracking compensates for small
   sample-clock differences between independent audio devices.
-- Handshake messages and empty link polls use a compact BPSK frame with every
-  coded bit sent twice, while frames carrying IP fragments use QPSK.
+- Every convolutionally coded control bit is sent four times and every payload
+  bit twice. Acoustic payload fragments are limited to 96 bytes so channel
+  changes are corrected frequently.
 - Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
@@ -151,8 +152,9 @@ chosen physical audio devices and acoustic path.
   dependency-free.
 - Networking uses TUN on Linux and utun on macOS. After automatic setup, normal
   client network traffic is routed through the gateway.
-- The modem uses QPSK (4-QAM) and a 48 kHz sample rate for broad hardware
-  compatibility.
+- The initial robust profile uses repeated BPSK, a 2-6 kHz default band, and a
+  48 kHz sample rate for broad hardware compatibility. Faster modulation can be
+  added after the physical link is proven stable.
 - The initial implementation supports one client per gateway.
 - The initial link is unauthenticated and unencrypted.
 - Startup and operation log the selected input/output audio devices and useful
