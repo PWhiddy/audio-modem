@@ -186,15 +186,23 @@ static int configure_tunnel(tunnel_t *tunnel, char *err, size_t err_size)
     const char *local = tunnel->gateway ? "10.77.0.1" : "10.77.0.2";
     const char *peer = tunnel->gateway ? "10.77.0.2" : "10.77.0.1";
     const char *ifconfig[] = {"/sbin/ifconfig", tunnel->name, "inet", local,
-        peer, "netmask", "255.255.255.252", "mtu", "1280", "up", NULL};
-    const char *local6 = tunnel->gateway ? "fd77::1" : "fd77::2";
-    const char *peer6 = tunnel->gateway ? "fd77::2" : "fd77::1";
+        peer, "mtu", "1280", "netmask", "255.255.255.255", "up", NULL};
+    const char *local6 = tunnel->gateway ? "fd77::1/126" : "fd77::2/126";
     const char *ifconfig6[] = {"/sbin/ifconfig", tunnel->name, "inet6", local6,
-        peer6, "prefixlen", "126", NULL};
+        "mtu", "1280", "up", NULL};
 
-    if (run_command(ifconfig) != 0 || run_command(ifconfig6) != 0) {
-        errno = EPERM;
-        set_error(err, err_size, "cannot configure utun interface");
+    if (run_command(ifconfig) != 0) {
+        if (err && err_size)
+            snprintf(err, err_size,
+                     "cannot assign the IPv4 local/peer addresses to %s",
+                     tunnel->name);
+        return -1;
+    }
+    if (run_command(ifconfig6) != 0) {
+        if (err && err_size)
+            snprintf(err, err_size,
+                     "cannot assign the IPv6 local/peer addresses to %s",
+                     tunnel->name);
         return -1;
     }
     tunnel->configured = 1;
@@ -209,8 +217,9 @@ static int configure_tunnel(tunnel_t *tunnel, char *err, size_t err_size)
             "8000::/1", "fd77::1", NULL};
         if (run_command(route_a) != 0 || run_command(route_b) != 0 ||
             run_command(route6_a) != 0 || run_command(route6_b) != 0) {
-            errno = EPERM;
-            set_error(err, err_size, "cannot install client routes");
+            if (err && err_size)
+                snprintf(err, err_size, "cannot install client routes on %s",
+                         tunnel->name);
             return -1;
         }
         return 0;
