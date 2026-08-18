@@ -1,6 +1,6 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread -MMD -MP -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread -MMD -MP
 CPPFLAGS += -Isrc
 
 COMMON_SRC = src/main.c src/modem.c src/packet.c
@@ -8,9 +8,11 @@ UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Linux)
   PLATFORM_SRC = src/audio_linux.c src/tunnel_linux.c
+  CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
   LDLIBS += -lm -ldl -pthread
 else ifeq ($(UNAME_S),Darwin)
   PLATFORM_SRC = src/audio_macos.c src/tunnel_macos.c
+  CPPFLAGS += -D_DARWIN_C_SOURCE
   LDLIBS += -lm -pthread -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 else
   $(error Unsupported operating system: $(UNAME_S))
