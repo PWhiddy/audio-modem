@@ -18,14 +18,17 @@
 #include <unistd.h>
 
 #define FLAG_MORE 1u
-#define SEARCH_MS 3000u
+#define SEARCH_MS 5000u
 #define IDLE_POLL_MS 1000u
 #define LINK_TIMEOUT_MS 30000u
 #define TURNAROUND_MS 250u
 #define OUTPUT_TAIL_MS 180u
+#define HANDSHAKE_SETTLE_MS 2500u
+#define RATE_INTERVAL_MS 5000u
+#define PROMOTE_CLEAN_TRANSACTIONS 4u
 
 enum client_state { CLIENT_SEARCH, CLIENT_WAIT_READY, CLIENT_READY,
-                    CLIENT_WAIT_RESPONSE };
+                    CLIENT_WAIT_RESPONSE, CLIENT_WAIT_PROFILE };
 enum gateway_state { GATEWAY_LISTEN, GATEWAY_WAIT_CONFIRM,
                      GATEWAY_CONNECTED };
 
@@ -53,6 +56,12 @@ typedef struct {
     uint16_t last_gateway_sequence;
     unsigned selected_low;
     unsigned selected_high;
+    enum modem_profile profile;
+    enum modem_profile profile_target;
+    int profile_resume_request;
+    unsigned clean_transactions;
+    uint64_t profile_attempts;
+    uint64_t profile_successes;
     uint64_t next_action;
     uint64_t last_receive;
     unsigned retries;
@@ -68,6 +77,11 @@ typedef struct {
     uint64_t dropped_packets;
     uint64_t retries_sent;
     uint64_t last_stats;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t rate_bytes_sent;
+    uint64_t rate_bytes_received;
+    uint64_t last_rate;
     double input_square_sum;
     float input_peak;
     uint64_t input_samples;
@@ -99,6 +113,21 @@ static void log_line(const app_t *app, const char *format, ...)
     vfprintf(stderr, format, args);
     va_end(args);
     fputc('\n', stderr);
+}
+
+static const char *profile_name(enum modem_profile profile)
+{
+    static const char *const names[MODEM_PROFILE_COUNT] = {
+        "safe", "robust", "balanced", "fast"};
+
+    if (profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT)
+        return "invalid";
+    return names[profile];
+}
+
+static size_t fragment_data_bytes(const modem_frame_t *frame)
+{
+    return frame->payload_len >= 8u ? frame->payload_len - 8u : 0u;
 }
 
 static void handle_signal(int signal_number)
@@ -203,7 +232,7 @@ static int send_frame(app_t *app, const modem_frame_t *frame, int bootstrap)
     unsigned low = bootstrap ? MODEM_MIN_HZ : app->selected_low;
     unsigned high = bootstrap ? MODEM_BOOTSTRAP_MAX_HZ : app->selected_high;
 
-    if (modem_encode(frame, low, high, &samples, &count) != 0) {
+    if (modem_encode(frame, low, high, app->profile, &samples, &count) != 0) {
         log_line(app, "cannot encode audio frame");
         return -1;
     }
@@ -231,9 +260,26 @@ static int send_frame(app_t *app, const modem_frame_t *frame, int bootstrap)
 static uint64_t retry_delay(const app_t *app)
 {
     size_t burst = modem_burst_samples(app->selected_low,
-                                       app->selected_high);
+                                       app->selected_high, app->profile);
     /* A complete request and response, plus device and room latency. */
     return 1000u + (uint64_t)burst * 2000u / AUDIO_SAMPLE_RATE;
+}
+
+static int set_data_profile(app_t *app, enum modem_profile profile)
+{
+    modem_decoder_t *decoder;
+
+    if (profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT)
+        return -1;
+    decoder = app->link_matches_bootstrap ? app->bootstrap_decoder
+                                          : app->link_decoder;
+    if (modem_decoder_set_profile(decoder, profile) != 0)
+        return -1;
+    app->profile = profile;
+    app->clean_transactions = 0;
+    app->profile_attempts = 0;
+    app->profile_successes = 0;
+    return 0;
 }
 
 static int set_link_band(app_t *app, unsigned low, unsigned high)
@@ -245,7 +291,18 @@ static int set_link_band(app_t *app, unsigned low, unsigned high)
     app->link_decoder_enabled = 1;
     app->link_matches_bootstrap =
         low == MODEM_MIN_HZ && high == MODEM_BOOTSTRAP_MAX_HZ;
-    return 0;
+    return set_data_profile(app, MODEM_PROFILE_SAFE);
+}
+
+static void reset_profile(app_t *app)
+{
+    app->profile = MODEM_PROFILE_SAFE;
+    app->clean_transactions = 0;
+    app->profile_attempts = 0;
+    app->profile_successes = 0;
+    (void)modem_decoder_set_profile(app->bootstrap_decoder,
+                                    MODEM_PROFILE_SAFE);
+    (void)modem_decoder_set_profile(app->link_decoder, MODEM_PROFILE_SAFE);
 }
 
 static void reset_client(app_t *app, const char *reason)
@@ -258,6 +315,7 @@ static void reset_client(app_t *app, const char *reason)
     app->sequence = 1;
     app->next_action = 0;
     app->retries = 0;
+    reset_profile(app);
     packet_receiver_init(&app->receiver);
 }
 
@@ -272,6 +330,7 @@ static void reset_gateway(app_t *app, const char *reason)
     app->last_gateway_sequence = 0;
     app->cached_response_valid = 0;
     app->response_fragment_pending = 0;
+    reset_profile(app);
     packet_receiver_init(&app->receiver);
 }
 
@@ -325,6 +384,38 @@ static void send_ready(app_t *app)
     (void)send_frame(app, &frame, 1);
 }
 
+static void send_profile_control(app_t *app, enum modem_profile profile,
+                                 int acknowledgement, uint16_t sequence,
+                                 int request_cached)
+{
+    modem_frame_t frame;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.type = MODEM_PROFILE_SELECT;
+    frame.flags = (uint8_t)profile;
+    frame.session = app->session;
+    frame.seq = sequence;
+    if (acknowledgement) {
+        frame.ack = frame.seq;
+        frame.band_low = request_cached ? 1u : 0u;
+    }
+    if (send_frame(app, &frame, 1) == 0 && !acknowledgement)
+        app->next_action = milliseconds() + SEARCH_MS;
+}
+
+static void begin_profile_change(app_t *app, enum modem_profile target,
+                                 int resume_request, const char *reason)
+{
+    log_line(app, "requesting %s profile (%ux repetition, %zu-byte frames): %s",
+             profile_name(target), modem_profile_repetitions(target),
+             modem_profile_payload_limit(target), reason);
+    app->profile_target = target;
+    app->profile_resume_request = resume_request;
+    app->client_state = CLIENT_WAIT_PROFILE;
+    app->retries = 0;
+    send_profile_control(app, target, 0, app->sequence, 0);
+}
+
 static void deliver_fragment(app_t *app, const modem_frame_t *frame)
 {
     packet_t packet;
@@ -345,6 +436,34 @@ static void deliver_fragment(app_t *app, const modem_frame_t *frame)
         ++app->dropped_packets;
         log_line(app, "discarded invalid packet fragment");
     }
+}
+
+static void stage_client_request(app_t *app)
+{
+    memset(&app->pending_request, 0, sizeof(app->pending_request));
+    app->pending_request.type = MODEM_REQUEST;
+    app->pending_request.session = app->session;
+    app->pending_request.seq = app->sequence;
+    app->pending_request.payload_len = (uint16_t)packet_sender_fragment(
+        &app->sender, &app->outbound, app->pending_request.payload,
+        modem_profile_payload_limit(app->profile));
+    if (app->sender.active || app->outbound.count)
+        app->pending_request.flags |= FLAG_MORE;
+}
+
+static void stage_gateway_response(app_t *app, uint16_t sequence)
+{
+    memset(&app->cached_response, 0, sizeof(app->cached_response));
+    app->cached_response.type = MODEM_RESPONSE;
+    app->cached_response.session = app->session;
+    app->cached_response.seq = sequence;
+    app->cached_response.ack = sequence;
+    app->cached_response.payload_len = (uint16_t)packet_sender_fragment(
+        &app->sender, &app->outbound, app->cached_response.payload,
+        modem_profile_payload_limit(app->profile));
+    app->response_fragment_pending = app->cached_response.payload_len != 0;
+    if (app->response_fragment_pending || app->outbound.count)
+        app->cached_response.flags |= FLAG_MORE;
 }
 
 static void client_frame(app_t *app, const modem_frame_t *frame)
@@ -371,16 +490,91 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
     if (app->client_state == CLIENT_WAIT_READY && frame->type == MODEM_READY) {
         app->client_state = CLIENT_READY;
         app->sequence = 1;
-        app->next_action = now;
+        app->next_action = now + HANDSHAKE_SETTLE_MS;
         app->last_receive = now;
-        log_line(app, "link up (session %08x, repeated-BPSK OFDM, %u-%u Hz)",
-                 app->session, app->selected_low, app->selected_high);
+        app->last_rate = now;
+        app->rate_bytes_sent = app->bytes_sent;
+        app->rate_bytes_received = app->bytes_received;
+        log_line(app,
+                 "link up (session %08x, %s profile: %ux/%zu bytes, %u-%u Hz); settling %u ms",
+                 app->session, profile_name(app->profile),
+                 modem_profile_repetitions(app->profile),
+                 modem_profile_payload_limit(app->profile), app->selected_low,
+                 app->selected_high, HANDSHAKE_SETTLE_MS);
+        return;
+    }
+    if (app->client_state == CLIENT_WAIT_PROFILE &&
+        frame->type == MODEM_PROFILE_SELECT &&
+        frame->flags == (uint8_t)app->profile_target &&
+        frame->seq == app->sequence && frame->ack == frame->seq &&
+        frame->band_low <= 1u) {
+        int resume_request = app->profile_resume_request;
+        int request_cached = frame->band_low == 1u;
+
+        if (set_data_profile(app, app->profile_target) != 0) {
+            reset_client(app, "invalid profile acknowledgement");
+            return;
+        }
+        log_line(app, "profile active: %s (%ux repetition, %zu-byte frames)",
+                 profile_name(app->profile),
+                 modem_profile_repetitions(app->profile),
+                 modem_profile_payload_limit(app->profile));
+        app->profile_resume_request = 0;
+        app->retries = 0;
+        if (resume_request) {
+            modem_frame_t retry_frame;
+            const modem_frame_t *outgoing;
+
+            if (request_cached) {
+                memset(&retry_frame, 0, sizeof(retry_frame));
+                retry_frame.type = MODEM_REQUEST;
+                retry_frame.session = app->session;
+                retry_frame.seq = app->sequence;
+                outgoing = &retry_frame;
+            } else {
+                stage_client_request(app);
+                outgoing = &app->pending_request;
+            }
+            if (send_frame(app, outgoing, 0) == 0) {
+                app->client_state = CLIENT_WAIT_RESPONSE;
+                app->next_action = milliseconds() + retry_delay(app);
+                if (request_cached)
+                    log_line(app,
+                             "requesting cached response for link sequence %u using %s profile",
+                             app->sequence, profile_name(app->profile));
+                else
+                    log_line(app,
+                             "link sequence %u re-sent using %s profile (%zu bytes up)",
+                             app->sequence, profile_name(app->profile),
+                             fragment_data_bytes(&app->pending_request));
+            }
+        } else {
+            app->client_state = CLIENT_READY;
+            app->next_action = now;
+        }
         return;
     }
     if (app->client_state == CLIENT_WAIT_RESPONSE &&
         frame->type == MODEM_RESPONSE && frame->ack == app->sequence) {
+        size_t sent_bytes = fragment_data_bytes(&app->pending_request);
+        size_t received_bytes = fragment_data_bytes(frame);
+        int carried_data = sent_bytes != 0 || received_bytes != 0;
+
+        app->bytes_sent += sent_bytes;
+        app->bytes_received += received_bytes;
         packet_sender_commit(&app->sender);
         deliver_fragment(app, frame);
+        if (carried_data) {
+            ++app->profile_attempts;
+            ++app->profile_successes;
+            if (app->retries == 0)
+                ++app->clean_transactions;
+            else
+                app->clean_transactions = 0;
+            log_line(app,
+                     "link sequence %u acknowledged (%zu bytes up, %zu bytes down)",
+                     app->sequence, sent_bytes, received_bytes);
+        }
         if (++app->sequence == 0)
             app->sequence = 1;
         app->client_state = CLIENT_READY;
@@ -390,6 +584,13 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
                             (frame->flags & FLAG_MORE))
                                ? now
                                : now + IDLE_POLL_MS;
+        if (carried_data &&
+            app->clean_transactions >= PROMOTE_CLEAN_TRANSACTIONS &&
+            app->profile < MODEM_PROFILE_FAST) {
+            begin_profile_change(
+                app, (enum modem_profile)(app->profile + 1), 0,
+                "clean transfer streak");
+        }
     }
 }
 
@@ -397,9 +598,7 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
 {
     uint64_t now = milliseconds();
 
-    if (frame->type == MODEM_HELLO &&
-        (app->gateway_state != GATEWAY_CONNECTED ||
-         frame->session == app->session)) {
+    if (frame->type == MODEM_HELLO) {
         unsigned low = frame->band_low > app->options.low_hz
                            ? frame->band_low : app->options.low_hz;
         unsigned high = frame->band_high < app->options.high_hz
@@ -408,11 +607,18 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
             return;
         if (app->gateway_state == GATEWAY_LISTEN ||
             frame->session != app->session) {
+            if (app->gateway_state == GATEWAY_CONNECTED)
+                log_line(app, "client requested a fresh link; restarting handshake");
             app->session = frame->session;
             if (set_link_band(app, low, high) != 0)
                 return;
             app->gateway_state = GATEWAY_WAIT_CONFIRM;
             app->retries = 0;
+            app->sequence = 1;
+            app->last_gateway_sequence = 0;
+            app->cached_response_valid = 0;
+            app->response_fragment_pending = 0;
+            packet_receiver_init(&app->receiver);
             log_line(app, "request heard (session %08x); offering %u-%u Hz",
                      app->session, low, high);
         }
@@ -429,14 +635,49 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
         app->last_gateway_sequence = 0;
         app->last_receive = now;
         app->cached_response_valid = 0;
+        app->last_rate = now;
+        app->rate_bytes_sent = app->bytes_sent;
+        app->rate_bytes_received = app->bytes_received;
         packet_receiver_init(&app->receiver);
-        log_line(app, "link up (session %08x, repeated-BPSK OFDM, %u-%u Hz)",
-                 app->session, app->selected_low, app->selected_high);
+        log_line(app,
+                 "link up (session %08x, %s profile: %ux/%zu bytes, %u-%u Hz)",
+                 app->session, profile_name(app->profile),
+                 modem_profile_repetitions(app->profile),
+                 modem_profile_payload_limit(app->profile), app->selected_low,
+                 app->selected_high);
         return;
     }
     if (app->gateway_state == GATEWAY_CONNECTED &&
         frame->type == MODEM_CONFIRM) {
         send_ready(app);
+        return;
+    }
+    if (app->gateway_state == GATEWAY_CONNECTED &&
+        frame->type == MODEM_PROFILE_SELECT &&
+        frame->flags < MODEM_PROFILE_COUNT && frame->ack == 0) {
+        enum modem_profile target = (enum modem_profile)frame->flags;
+        enum modem_profile previous = app->profile;
+        int request_cached = frame->seq == app->last_gateway_sequence &&
+                             app->cached_response_valid;
+
+        send_profile_control(app, target, 1, frame->seq, request_cached);
+        if (target != previous && app->response_fragment_pending &&
+            (target > previous || !request_cached)) {
+            app->bytes_sent += fragment_data_bytes(&app->cached_response);
+            packet_sender_commit(&app->sender);
+            app->response_fragment_pending = 0;
+        }
+        if (target != previous && set_data_profile(app, target) == 0) {
+            if (target < previous && request_cached &&
+                app->response_fragment_pending)
+                stage_gateway_response(app, app->last_gateway_sequence);
+            log_line(app,
+                     "profile active: %s (%ux repetition, %zu-byte frames)",
+                     profile_name(app->profile),
+                     modem_profile_repetitions(app->profile),
+                     modem_profile_payload_limit(app->profile));
+        }
+        app->last_receive = now;
         return;
     }
     if (app->gateway_state != GATEWAY_CONNECTED ||
@@ -454,19 +695,18 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
         return;
 
     if (app->response_fragment_pending)
+        app->bytes_sent += fragment_data_bytes(&app->cached_response);
+    if (app->response_fragment_pending)
         packet_sender_commit(&app->sender);
     app->response_fragment_pending = 0;
+    app->bytes_received += fragment_data_bytes(frame);
     deliver_fragment(app, frame);
-    memset(&app->cached_response, 0, sizeof(app->cached_response));
-    app->cached_response.type = MODEM_RESPONSE;
-    app->cached_response.session = app->session;
-    app->cached_response.seq = frame->seq;
-    app->cached_response.ack = frame->seq;
-    app->cached_response.payload_len = (uint16_t)packet_sender_fragment(
-        &app->sender, &app->outbound, app->cached_response.payload);
-    app->response_fragment_pending = app->cached_response.payload_len != 0;
-    if (app->response_fragment_pending || app->outbound.count)
-        app->cached_response.flags |= FLAG_MORE;
+    stage_gateway_response(app, frame->seq);
+    if (frame->payload_len || app->cached_response.payload_len)
+        log_line(app,
+                 "link sequence %u received (%zu bytes up); responding with %zu bytes down",
+                 frame->seq, fragment_data_bytes(frame),
+                 fragment_data_bytes(&app->cached_response));
     (void)send_frame(app, &app->cached_response, 0);
     app->cached_response_valid = 1;
     app->last_gateway_sequence = frame->seq;
@@ -518,18 +758,32 @@ static void pump_audio(app_t *app)
 
 static void maybe_log_audio_status(app_t *app, uint64_t now)
 {
-    modem_activity_t activity;
-    int connecting;
+    modem_activity_t activity, link_activity;
+    int connecting, waiting_for_peer, report;
 
     if (now < app->next_audio_status)
         return;
     app->next_audio_status = now + 5000u;
     modem_decoder_take_activity(app->bootstrap_decoder, &activity);
+    if (app->link_decoder_enabled && !app->link_matches_bootstrap) {
+        modem_decoder_take_activity(app->link_decoder, &link_activity);
+        if (link_activity.peak_sync > activity.peak_sync)
+            activity.peak_sync = link_activity.peak_sync;
+        activity.candidates += link_activity.candidates;
+        activity.rejected += link_activity.rejected;
+    }
     connecting = app->options.gateway
                      ? app->gateway_state != GATEWAY_CONNECTED
                      : app->client_state != CLIENT_READY &&
-                           app->client_state != CLIENT_WAIT_RESPONSE;
-    if (connecting) {
+                           app->client_state != CLIENT_WAIT_RESPONSE &&
+                           app->client_state != CLIENT_WAIT_PROFILE;
+    waiting_for_peer = app->options.gateway
+                           ? app->gateway_state == GATEWAY_CONNECTED
+                           : app->client_state == CLIENT_WAIT_RESPONSE ||
+                                 app->client_state == CLIENT_WAIT_PROFILE;
+    report = connecting || activity.rejected ||
+             (waiting_for_peer && activity.peak_sync > 0.0);
+    if (report) {
         if (app->input_samples) {
             double rms = sqrt(app->input_square_sum / app->input_samples);
             double rms_db = 20.0 * log10(rms > 1.0e-6 ? rms : 1.0e-6);
@@ -582,29 +836,43 @@ static void client_tick(app_t *app, uint64_t now)
             send_confirm(app);
         }
     } else if (app->client_state == CLIENT_READY && now >= app->next_action) {
-        memset(&app->pending_request, 0, sizeof(app->pending_request));
-        app->pending_request.type = MODEM_REQUEST;
-        app->pending_request.session = app->session;
-        app->pending_request.seq = app->sequence;
-        app->pending_request.payload_len = (uint16_t)packet_sender_fragment(
-            &app->sender, &app->outbound, app->pending_request.payload);
-        if (app->sender.active || app->outbound.count)
-            app->pending_request.flags |= FLAG_MORE;
+        stage_client_request(app);
         if (send_frame(app, &app->pending_request, 0) == 0) {
             app->client_state = CLIENT_WAIT_RESPONSE;
-            app->next_action = now + retry_delay(app);
+            app->next_action = milliseconds() + retry_delay(app);
             app->retries = 0;
+            if (app->pending_request.payload_len)
+                log_line(app, "link sequence %u sent (%zu bytes up, %s profile)",
+                         app->sequence,
+                         fragment_data_bytes(&app->pending_request),
+                         profile_name(app->profile));
         }
     } else if (app->client_state == CLIENT_WAIT_RESPONSE &&
                now >= app->next_action) {
-        if (++app->retries > 4u) {
+        ++app->profile_attempts;
+        app->clean_transactions = 0;
+        ++app->retries_sent;
+        if (app->profile > MODEM_PROFILE_SAFE) {
+            begin_profile_change(
+                app, (enum modem_profile)(app->profile - 1), 1,
+                "missed audio response");
+        } else if (++app->retries > 4u) {
             reset_client(app, "audio response timed out");
         } else {
             log_line(app, "re-sending link sequence %u (%u/4)",
                      app->sequence, app->retries);
             (void)send_frame(app, &app->pending_request, 0);
-            app->next_action = now + retry_delay(app);
-            ++app->retries_sent;
+            app->next_action = milliseconds() + retry_delay(app);
+        }
+    } else if (app->client_state == CLIENT_WAIT_PROFILE &&
+               now >= app->next_action) {
+        if (++app->retries > 4u) {
+            reset_client(app, "profile change was not acknowledged");
+        } else {
+            log_line(app, "re-sending %s profile request (%u/4)",
+                     profile_name(app->profile_target), app->retries);
+            send_profile_control(app, app->profile_target, 0, app->sequence,
+                                 0);
         }
     }
 }
@@ -622,6 +890,45 @@ static void gateway_tick(app_t *app, uint64_t now)
                now - app->last_receive > LINK_TIMEOUT_MS) {
         reset_gateway(app, "client heartbeat timed out");
     }
+}
+
+static void maybe_log_rate(app_t *app, uint64_t now)
+{
+    uint64_t elapsed, sent, received, upload, download;
+    int connected = app->options.gateway
+                        ? app->gateway_state == GATEWAY_CONNECTED
+                        : app->client_state == CLIENT_READY ||
+                              app->client_state == CLIENT_WAIT_RESPONSE ||
+                              app->client_state == CLIENT_WAIT_PROFILE;
+
+    if (!connected || now - app->last_rate < RATE_INTERVAL_MS)
+        return;
+    elapsed = now - app->last_rate;
+    sent = app->bytes_sent - app->rate_bytes_sent;
+    received = app->bytes_received - app->rate_bytes_received;
+    upload = app->options.gateway ? received : sent;
+    download = app->options.gateway ? sent : received;
+    if (app->options.gateway) {
+        log_line(app,
+                 "throughput: upload %.1f B/s, download %.1f B/s; %s profile (%ux/%zu bytes)",
+                 upload * 1000.0 / elapsed, download * 1000.0 / elapsed,
+                 profile_name(app->profile),
+                 modem_profile_repetitions(app->profile),
+                 modem_profile_payload_limit(app->profile));
+    } else {
+        double success = app->profile_attempts
+                             ? app->profile_successes * 100.0 /
+                                   app->profile_attempts
+                             : 100.0;
+        log_line(app,
+                 "throughput: upload %.1f B/s, download %.1f B/s; %s profile, %.0f%% acknowledged, clean streak %u/%u",
+                 upload * 1000.0 / elapsed, download * 1000.0 / elapsed,
+                 profile_name(app->profile), success,
+                 app->clean_transactions, PROMOTE_CLEAN_TRANSACTIONS);
+    }
+    app->last_rate = now;
+    app->rate_bytes_sent = app->bytes_sent;
+    app->rate_bytes_received = app->bytes_received;
 }
 
 static void maybe_log_stats(app_t *app, uint64_t now)
@@ -772,7 +1079,9 @@ static int run_app(const options_t *options)
     log_line(&app, "audio input:  %s", audio_input_name(app.audio));
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
     log_line(&app,
-             "audio format: mono 48 kHz; repeated-BPSK OFDM (control 4x, data 2x); bootstrap band 2000-6000 Hz");
+             "audio format: mono 48 kHz; adaptive repeated-BPSK OFDM; bootstrap/control 8x at 2000-6000 Hz");
+    log_line(&app,
+             "data profiles: safe 8x/16 bytes -> robust 4x/32 -> balanced 3x/64 -> fast 2x/96");
     log_line(&app,
              "half-duplex timing: %u ms turnaround; local transmit echo suppressed",
              TURNAROUND_MS);
@@ -814,6 +1123,7 @@ static int run_app(const options_t *options)
         else
             client_tick(&app, now);
         maybe_log_audio_status(&app, now);
+        maybe_log_rate(&app, now);
         maybe_log_stats(&app, now);
         nanosleep(&pause, NULL);
     }

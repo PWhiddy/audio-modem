@@ -4,7 +4,7 @@
 #include <string.h>
 
 #define FRAGMENT_HEADER 8u
-#define FRAGMENT_DATA (MODEM_PAYLOAD_MAX - FRAGMENT_HEADER)
+#define FRAGMENT_DATA_MAX (MODEM_PAYLOAD_MAX - FRAGMENT_HEADER)
 
 static uint16_t get_u16(const uint8_t *p)
 {
@@ -52,9 +52,14 @@ void packet_sender_init(packet_sender_t *sender)
 }
 
 size_t packet_sender_fragment(packet_sender_t *sender, packet_queue_t *queue,
-                              uint8_t out[MODEM_PAYLOAD_MAX])
+                              uint8_t out[MODEM_PAYLOAD_MAX],
+                              size_t payload_limit)
 {
     size_t chunk;
+
+    if (payload_limit < FRAGMENT_HEADER + 1u ||
+        payload_limit > MODEM_PAYLOAD_MAX)
+        return 0;
 
     if (!sender->active) {
         if (!packet_queue_pop(queue, &sender->packet))
@@ -63,8 +68,9 @@ size_t packet_sender_fragment(packet_sender_t *sender, packet_queue_t *queue,
         sender->active = 1;
     }
     chunk = sender->packet.len - sender->offset;
-    if (chunk > FRAGMENT_DATA)
-        chunk = FRAGMENT_DATA;
+    if (chunk > payload_limit - FRAGMENT_HEADER)
+        chunk = payload_limit - FRAGMENT_HEADER;
+    sender->staged = chunk;
     put_u16(out, sender->id);
     put_u16(out + 2, (uint16_t)sender->offset);
     put_u16(out + 4, (uint16_t)sender->packet.len);
@@ -79,10 +85,11 @@ void packet_sender_commit(packet_sender_t *sender)
 
     if (!sender->active)
         return;
-    chunk = sender->packet.len - sender->offset;
-    if (chunk > FRAGMENT_DATA)
-        chunk = FRAGMENT_DATA;
+    chunk = sender->staged;
+    if (chunk == 0 || chunk > sender->packet.len - sender->offset)
+        return;
     sender->offset += chunk;
+    sender->staged = 0;
     if (sender->offset == sender->packet.len) {
         sender->active = 0;
         sender->offset = 0;
@@ -108,7 +115,7 @@ int packet_receiver_add(packet_receiver_t *receiver, const uint8_t *fragment,
     total = get_u16(fragment + 4);
     chunk = get_u16(fragment + 6);
     if (id == 0 || total == 0 || total > PACKET_MAX ||
-        chunk > FRAGMENT_DATA || len != (size_t)chunk + FRAGMENT_HEADER ||
+        chunk > FRAGMENT_DATA_MAX || len != (size_t)chunk + FRAGMENT_HEADER ||
         (size_t)offset + chunk > total)
         return -1;
     if (!receiver->active && id == receiver->last_complete)
@@ -148,7 +155,9 @@ int packet_self_test(void)
     packet_t result;
     uint8_t source[PACKET_MAX];
     uint8_t fragment[MODEM_PAYLOAD_MAX];
+    static const size_t limits[] = {16u, 32u, 64u, 96u};
     size_t len, i;
+    unsigned fragment_index = 0;
     int status = 0;
     int complete = 0;
 
@@ -160,7 +169,10 @@ int packet_self_test(void)
     if (packet_queue_push(&queue, source, sizeof(source)) != 0)
         status = -1;
     while (!status && (sender.active || queue.count)) {
-        len = packet_sender_fragment(&sender, &queue, fragment);
+        size_t limit = limits[fragment_index %
+                              (sizeof(limits) / sizeof(limits[0]))];
+        len = packet_sender_fragment(&sender, &queue, fragment, limit);
+        ++fragment_index;
         if (len == 0)
             status = -1;
         else {

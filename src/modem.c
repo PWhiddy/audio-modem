@@ -21,8 +21,7 @@
 #define CODE_STEPS (RAW_BITS + 6u)
 #define CODE_BITS (CODE_STEPS * 2u)
 #define BITS_PER_CARRIER 1u
-#define CONTROL_REPETITIONS 4u
-#define DATA_REPETITIONS 2u
+#define CONTROL_REPETITIONS 8u
 #define RX_CAPACITY (AUDIO_SAMPLE_RATE * 6u)
 #define PI 3.14159265358979323846
 
@@ -30,11 +29,11 @@ typedef struct {
     unsigned low_bin;
     unsigned high_bin;
     unsigned data_carriers;
-    unsigned symbols;
 } band_t;
 
 struct modem_decoder {
     band_t band;
+    enum modem_profile profile;
     float *rx;
     size_t length;
     size_t search_position;
@@ -91,6 +90,30 @@ static unsigned parity(unsigned value)
     return (0x6996u >> value) & 1u;
 }
 
+size_t modem_profile_payload_limit(enum modem_profile profile)
+{
+    static const size_t limits[MODEM_PROFILE_COUNT] = {16u, 32u, 64u, 96u};
+
+    if (profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT)
+        return 0;
+    return limits[profile];
+}
+
+unsigned modem_profile_repetitions(enum modem_profile profile)
+{
+    static const unsigned repetitions[MODEM_PROFILE_COUNT] = {8u, 4u, 3u,
+                                                               2u};
+
+    if (profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT)
+        return 0;
+    return repetitions[profile];
+}
+
+static size_t data_raw_length(enum modem_profile profile)
+{
+    return HEADER_N + modem_profile_payload_limit(profile) + 4u;
+}
+
 static int make_band(unsigned low_hz, unsigned high_hz, band_t *band)
 {
     unsigned k, pilots = 0;
@@ -113,10 +136,6 @@ static int make_band(unsigned low_hz, unsigned high_hz, band_t *band)
     band->data_carriers = band->high_bin - band->low_bin + 1u - pilots;
     if (band->data_carriers < 6u)
         return -1;
-    band->symbols =
-        (CODE_BITS * DATA_REPETITIONS +
-         band->data_carriers * BITS_PER_CARRIER - 1u) /
-                    (band->data_carriers * BITS_PER_CARRIER);
     return 0;
 }
 
@@ -127,13 +146,14 @@ static unsigned symbols_for_bits(const band_t *band, size_t bits,
     return (unsigned)((bits + bits_per_symbol - 1u) / bits_per_symbol);
 }
 
-static size_t samples_for_raw(const band_t *band, size_t raw_length)
+static size_t samples_for_raw(const band_t *band, size_t raw_length,
+                              enum modem_profile profile)
 {
     size_t code_bits = (raw_length * 8u + 6u) * 2u;
     int control = raw_length == CONTROL_RAW_N;
     size_t transmitted_bits = code_bits *
                               (control ? CONTROL_REPETITIONS
-                                       : DATA_REPETITIONS);
+                                       : modem_profile_repetitions(profile));
     return 2u * SYMBOL_N +
            (size_t)symbols_for_bits(band, transmitted_bits,
                                     BITS_PER_CARRIER) *
@@ -224,7 +244,7 @@ static void serialize_frame(const modem_frame_t *frame, uint8_t raw[RAW_N])
     memset(raw, 0, RAW_N);
     raw[0] = 0xa7;
     raw[1] = 0x3c;
-    raw[2] = 1;
+    raw[2] = 2;
     raw[3] = frame->type;
     raw[4] = frame->flags;
     put_u32(raw + 6, frame->session);
@@ -245,11 +265,12 @@ static int parse_frame(const uint8_t raw[RAW_N], size_t raw_length,
 {
     uint16_t payload_len;
 
-    if (raw[0] != 0xa7 || raw[1] != 0x3c || raw[2] != 1 ||
-        raw[3] < MODEM_HELLO || raw[3] > MODEM_RESPONSE)
+    if (raw[0] != 0xa7 || raw[1] != 0x3c || raw[2] != 2 ||
+        raw[3] < MODEM_HELLO || raw[3] > MODEM_PROFILE_SELECT)
         return -1;
     payload_len = get_u16(raw + 18);
     if (payload_len > MODEM_PAYLOAD_MAX ||
+        payload_len > raw_length - HEADER_N - 4u ||
         HEADER_N + payload_len + 4u > raw_length ||
         get_u32(raw + HEADER_N + payload_len) !=
             crc32(raw, HEADER_N + payload_len))
@@ -341,7 +362,7 @@ static int convolutional_decode(const float llr[CODE_BITS], size_t raw_length,
 }
 
 int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
-                 float **samples, size_t *count)
+                 enum modem_profile profile, float **samples, size_t *count)
 {
     band_t band;
     uint8_t raw[RAW_N], code[CODE_BITS];
@@ -355,15 +376,19 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
     double peak = 0.0;
 
     if (!frame || !samples || !count ||
+        profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT ||
         frame->payload_len > MODEM_PAYLOAD_MAX ||
+        (frame->payload_len != 0 &&
+         frame->payload_len > modem_profile_payload_limit(profile)) ||
         make_band(low_hz, high_hz, &band) != 0)
         return -1;
     serialize_frame(frame, raw);
     control = frame->payload_len == 0;
-    raw_length = control ? CONTROL_RAW_N : RAW_N;
+    raw_length = control ? CONTROL_RAW_N : data_raw_length(profile);
     code_bits = convolutional_encode(raw, raw_length, code);
     transmitted_bits = code_bits *
-                       (control ? CONTROL_REPETITIONS : DATA_REPETITIONS);
+                       (control ? CONTROL_REPETITIONS
+                                : modem_profile_repetitions(profile));
     symbols = symbols_for_bits(&band, transmitted_bits, BITS_PER_CARRIER);
     total = LEAD_N + 2u * SYMBOL_N + (size_t)symbols * SYMBOL_N + TAIL_N;
     output = calloc(total, sizeof(*output));
@@ -413,12 +438,23 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
     return 0;
 }
 
-size_t modem_burst_samples(unsigned low_hz, unsigned high_hz)
+size_t modem_burst_samples(unsigned low_hz, unsigned high_hz,
+                           enum modem_profile profile)
 {
     band_t band;
+    size_t raw_length;
+    size_t code_bits, transmitted_bits;
+    unsigned symbols;
+
+    if (profile < MODEM_PROFILE_SAFE || profile >= MODEM_PROFILE_COUNT)
+        return 0;
+    raw_length = data_raw_length(profile);
     if (make_band(low_hz, high_hz, &band) != 0)
         return 0;
-    return LEAD_N + 2u * SYMBOL_N + (size_t)band.symbols * SYMBOL_N + TAIL_N;
+    code_bits = (raw_length * 8u + 6u) * 2u;
+    transmitted_bits = code_bits * modem_profile_repetitions(profile);
+    symbols = symbols_for_bits(&band, transmitted_bits, BITS_PER_CARRIER);
+    return LEAD_N + 2u * SYMBOL_N + (size_t)symbols * SYMBOL_N + TAIL_N;
 }
 
 void modem_free_samples(float *samples)
@@ -452,7 +488,8 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
     int control = raw_length == CONTROL_RAW_N;
     size_t transmitted_bits = code_bits *
                               (control ? CONTROL_REPETITIONS
-                                       : DATA_REPETITIONS);
+                                       : modem_profile_repetitions(
+                                             decoder->profile));
     size_t bit_pos = 0;
     long sample_adjustment = 0;
     unsigned symbols =
@@ -549,6 +586,7 @@ modem_decoder_t *modem_decoder_create(unsigned low_hz, unsigned high_hz)
 
     if (!decoder)
         return NULL;
+    decoder->profile = MODEM_PROFILE_SAFE;
     decoder->rx = malloc(RX_CAPACITY * sizeof(*decoder->rx));
     if (!decoder->rx || make_band(low_hz, high_hz, &decoder->band) != 0) {
         modem_decoder_destroy(decoder);
@@ -573,6 +611,19 @@ int modem_decoder_set_band(modem_decoder_t *decoder, unsigned low_hz,
     if (!decoder || make_band(low_hz, high_hz, &band) != 0)
         return -1;
     decoder->band = band;
+    decoder->length = 0;
+    decoder->search_position = 0;
+    decoder->pending = 0;
+    return 0;
+}
+
+int modem_decoder_set_profile(modem_decoder_t *decoder,
+                              enum modem_profile profile)
+{
+    if (!decoder || profile < MODEM_PROFILE_SAFE ||
+        profile >= MODEM_PROFILE_COUNT)
+        return -1;
+    decoder->profile = profile;
     decoder->length = 0;
     decoder->search_position = 0;
     decoder->pending = 0;
@@ -642,14 +693,18 @@ int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
         decoder->length += count;
     }
 
-    short_needed = samples_for_raw(&decoder->band, CONTROL_RAW_N);
-    long_needed = samples_for_raw(&decoder->band, RAW_N);
+    short_needed = samples_for_raw(&decoder->band, CONTROL_RAW_N,
+                                   decoder->profile);
+    long_needed = samples_for_raw(&decoder->band,
+                                  data_raw_length(decoder->profile),
+                                  decoder->profile);
     if (decoder->pending) {
         size_t start = decoder->pending_start;
         int result;
         if (decoder->length < start + long_needed + DETECT_LOOKAHEAD)
             return 0;
-        result = decode_at(decoder, start, RAW_N, frame);
+        result = decode_at(decoder, start, data_raw_length(decoder->profile),
+                           frame);
         decoder->pending = 0;
         discard_samples(decoder, start + long_needed);
         if (result == 0)
@@ -688,7 +743,8 @@ int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
         }
         if (decoder->length >=
             best_start + long_needed + DETECT_LOOKAHEAD) {
-            result = decode_at(decoder, best_start, RAW_N, frame);
+            result = decode_at(decoder, best_start,
+                               data_raw_length(decoder->profile), frame);
             discard_samples(decoder, best_start + long_needed);
             if (result == 0)
                 return 1;
@@ -710,7 +766,8 @@ static uint32_t test_random(uint32_t *state)
     return *state;
 }
 
-static int test_one_band(unsigned low, unsigned high)
+static int test_one_band(unsigned low, unsigned high,
+                         enum modem_profile profile)
 {
     modem_frame_t sent, received;
     modem_decoder_t *decoder;
@@ -728,15 +785,21 @@ static int test_one_band(unsigned low, unsigned high)
     sent.ack = 416;
     sent.band_low = (uint16_t)low;
     sent.band_high = (uint16_t)high;
-    sent.payload_len = MODEM_PAYLOAD_MAX;
+    sent.payload_len = (uint16_t)modem_profile_payload_limit(profile);
     for (i = 0; i < sent.payload_len; ++i)
         sent.payload[i] = (uint8_t)test_random(&random);
-    if (modem_encode(&sent, low, high, &encoded, &encoded_count) != 0)
+    if (modem_encode(&sent, low, high, profile, &encoded, &encoded_count) != 0)
         return -1;
     channel_count = encoded_count + 173u;
     channel = calloc(channel_count, sizeof(*channel));
     decoder = modem_decoder_create(low, high);
     if (!channel || !decoder) {
+        free(channel);
+        free(encoded);
+        modem_decoder_destroy(decoder);
+        return -1;
+    }
+    if (modem_decoder_set_profile(decoder, profile) != 0) {
         free(channel);
         free(encoded);
         modem_decoder_destroy(decoder);
@@ -770,13 +833,15 @@ static int test_one_band(unsigned low, unsigned high)
         received.session != sent.session || received.seq != sent.seq ||
         received.ack != sent.ack || received.payload_len != sent.payload_len ||
         memcmp(received.payload, sent.payload, sent.payload_len) != 0) {
-        fprintf(stderr, "modem self-test failed for %u-%u Hz\n", low, high);
+        fprintf(stderr, "modem profile %u self-test failed for %u-%u Hz\n",
+                (unsigned)profile, low, high);
         return -1;
     }
     return 0;
 }
 
-static int test_clock_mismatch(double ratio, int control)
+static int test_clock_mismatch(double ratio, int control,
+                               enum modem_profile profile)
 {
     modem_frame_t sent, received;
     modem_decoder_t *decoder = NULL;
@@ -793,10 +858,11 @@ static int test_clock_mismatch(double ratio, int control)
     sent.seq = control ? 0 : 73;
     sent.band_low = MODEM_MIN_HZ;
     sent.band_high = MODEM_MAX_HZ;
-    sent.payload_len = control ? 0 : MODEM_PAYLOAD_MAX;
+    sent.payload_len =
+        control ? 0 : (uint16_t)modem_profile_payload_limit(profile);
     for (i = 0; i < sent.payload_len; ++i)
         sent.payload[i] = (uint8_t)test_random(&random);
-    if (modem_encode(&sent, MODEM_MIN_HZ, phy_high, &encoded,
+    if (modem_encode(&sent, MODEM_MIN_HZ, phy_high, profile, &encoded,
                      &encoded_count) != 0)
         goto done;
     resampled_count = (size_t)(encoded_count * ratio);
@@ -804,6 +870,8 @@ static int test_clock_mismatch(double ratio, int control)
     channel = calloc(channel_count, sizeof(*channel));
     decoder = modem_decoder_create(MODEM_MIN_HZ, phy_high);
     if (!channel || !decoder)
+        goto done;
+    if (modem_decoder_set_profile(decoder, profile) != 0)
         goto done;
     for (i = 0; i < channel_count; ++i) {
         double noise = ((int)(test_random(&random) >> 16) - 32768) / 32768.0;
@@ -868,7 +936,7 @@ static int test_frame_stream(void)
     sent[1].type = MODEM_REQUEST;
     sent[1].session = 0x50607080u;
     sent[1].seq = 20;
-    sent[1].payload_len = 73;
+    sent[1].payload_len = 16;
     for (i = 0; i < sent[1].payload_len; ++i)
         sent[1].payload[i] = (uint8_t)(i * 29u + 7u);
     sent[2].type = MODEM_OFFER;
@@ -876,6 +944,7 @@ static int test_frame_stream(void)
     sent[2].seq = 21;
     for (i = 0; i < 3u; ++i)
         if (modem_encode(&sent[i], MODEM_MIN_HZ, MODEM_MAX_HZ,
+                         MODEM_PROFILE_SAFE,
                          &encoded[i], &encoded_count[i]) != 0)
             goto done;
     stream_count = 23u + encoded_count[0] + 17u + encoded_count[1] +
@@ -928,13 +997,20 @@ done:
 
 int modem_self_test(void)
 {
-    if (test_one_band(MODEM_MIN_HZ, MODEM_MAX_HZ) != 0 ||
-        test_one_band(MODEM_MIN_HZ, MODEM_DEFAULT_MAX_HZ) != 0 ||
-        test_one_band(3500u, 8500u) != 0 ||
-        test_clock_mismatch(0.998, 0) != 0 ||
-        test_clock_mismatch(1.002, 0) != 0 ||
-        test_clock_mismatch(0.998, 1) != 0 ||
-        test_clock_mismatch(1.002, 1) != 0 || test_frame_stream() != 0)
+    enum modem_profile profile;
+
+    for (profile = MODEM_PROFILE_SAFE; profile < MODEM_PROFILE_COUNT;
+         profile = (enum modem_profile)(profile + 1)) {
+        if (test_one_band(MODEM_MIN_HZ, MODEM_MAX_HZ, profile) != 0 ||
+            test_one_band(MODEM_MIN_HZ, MODEM_DEFAULT_MAX_HZ, profile) != 0 ||
+            test_one_band(3500u, 8500u, profile) != 0 ||
+            test_clock_mismatch(0.998, 0, profile) != 0 ||
+            test_clock_mismatch(1.002, 0, profile) != 0 ||
+            test_clock_mismatch(0.998, 1, profile) != 0 ||
+            test_clock_mismatch(1.002, 1, profile) != 0)
+            return -1;
+    }
+    if (test_frame_stream() != 0)
         return -1;
     return 0;
 }

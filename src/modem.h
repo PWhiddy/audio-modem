@@ -10,13 +10,22 @@
 #define MODEM_DEFAULT_MAX_HZ 6000u
 #define MODEM_PAYLOAD_MAX 96u
 
+enum modem_profile {
+    MODEM_PROFILE_SAFE = 0,
+    MODEM_PROFILE_ROBUST = 1,
+    MODEM_PROFILE_BALANCED = 2,
+    MODEM_PROFILE_FAST = 3,
+    MODEM_PROFILE_COUNT = 4
+};
+
 enum modem_frame_type {
     MODEM_HELLO = 1,
     MODEM_OFFER = 2,
     MODEM_CONFIRM = 3,
     MODEM_READY = 4,
     MODEM_REQUEST = 5,
-    MODEM_RESPONSE = 6
+    MODEM_RESPONSE = 6,
+    MODEM_PROFILE_SELECT = 7
 };
 
 typedef struct {
@@ -43,6 +52,8 @@ modem_decoder_t *modem_decoder_create(unsigned low_hz, unsigned high_hz);
 void modem_decoder_destroy(modem_decoder_t *decoder);
 int modem_decoder_set_band(modem_decoder_t *decoder, unsigned low_hz,
                            unsigned high_hz);
+int modem_decoder_set_profile(modem_decoder_t *decoder,
+                              enum modem_profile profile);
 /* Returns 1 with a frame, 0 when more samples are needed, and -1 on overflow. */
 int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
                        size_t count, modem_frame_t *frame);
@@ -51,8 +62,11 @@ void modem_decoder_take_activity(modem_decoder_t *decoder,
                                  modem_activity_t *activity);
 
 int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
-                 float **samples, size_t *count);
-size_t modem_burst_samples(unsigned low_hz, unsigned high_hz);
+                 enum modem_profile profile, float **samples, size_t *count);
+size_t modem_burst_samples(unsigned low_hz, unsigned high_hz,
+                           enum modem_profile profile);
+size_t modem_profile_payload_limit(enum modem_profile profile);
+unsigned modem_profile_repetitions(enum modem_profile profile);
 void modem_free_samples(float *samples);
 
 /* Deterministic DSP/codec tests, with diagnostic output on failure. */

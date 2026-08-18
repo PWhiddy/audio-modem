@@ -51,18 +51,19 @@ the existing default internet interface for forwarding and NAT. An upstream
 connection without IPv6 will naturally only provide working IPv4 service.
 
 The program logs its selected input and output devices, tunnel configuration,
-connection handshake, negotiated audio band, link transitions, retries, and
-periodic packet counters. Routine idle polls are intentionally not logged.
+connection handshake, negotiated audio band, link transitions, retries,
+adaptive data profile, and acknowledged upload/download bytes per second.
+Routine idle polls are intentionally not logged.
 
 The acoustic path is bidirectional: the client speaker must reach the gateway
 microphone, and the gateway speaker must reach the client microphone. While a
-side is waiting for the handshake, it reports its input RMS/peak level and best
-modem-sync score every five seconds. A score near zero means the selected
-microphone is not hearing a recognizable burst. A score approaching `0.55`
-means the burst is recognizable; `candidate frame rejected` means it found the
-OFDM preamble but the frame was too damaged to pass error correction and CRC.
-Move the relevant microphone closer or adjust output/input gain, while avoiding
-peaks near 0 dBFS because those indicate clipping.
+side is waiting for the handshake or a linked response, it reports its input
+RMS/peak level and best modem-sync score every five seconds. A score near zero
+means the selected microphone is not hearing a recognizable burst. A score
+approaching `0.55` means the burst is recognizable; `candidate frame rejected`
+means it found the OFDM preamble but the frame was too damaged to pass error
+correction and CRC. Move the relevant microphone closer or adjust output/input
+gain, while avoiding peaks near 0 dBFS because those indicate clipping.
 
 ## Options
 
@@ -101,9 +102,13 @@ privileges.
 - Repeated-BPSK data carriers, BPSK pilots and training symbols, cyclic prefixes,
   and per-burst channel/phase estimation. Pilot tracking compensates for small
   sample-clock differences between independent audio devices.
-- Every convolutionally coded control bit is sent four times and every payload
-  bit twice. Acoustic payload fragments are limited to 96 bytes so channel
-  changes are corrected frequently.
+- Discovery, handshake, and profile-control bits are repeated eight times. Data
+  starts in a deliberately slow `safe` profile (8x repetition and 16-byte
+  acoustic fragments), then advances after four clean data transactions through
+  `robust` (4x/32), `balanced` (3x/64), and `fast` (2x/96).
+- A missed response immediately requests the next safer profile over the 8x
+  control channel and retransmits the in-flight fragment without dropping the
+  tunnel. Lost profile acknowledgements are themselves retransmitted.
 - Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
@@ -114,9 +119,11 @@ privileges.
   discovery. A short turnaround guard and receive muting during local output
   keep each machine from decoding its own speaker echo as a peer frame.
 
-The link is designed for reliability and simplicity, not broadband speed.
-Actual throughput and error rate depend heavily on the microphones, speakers,
-room acoustics, volume, and selected band.
+The five-second throughput report counts acknowledged IP payload bytes, not
+audio samples or protocol overhead. The link is designed for reliability and
+simplicity, not broadband speed. Actual throughput and error rate depend
+heavily on the microphones, speakers, room acoustics, volume, and selected
+band.
 
 ## Network layout
 
@@ -137,9 +144,10 @@ inject or receive the audio can participate in or observe the link. Use it only
 in an environment where that is acceptable.
 
 The gateway accepts one client at a time. The deterministic self-test exercises
-maximum-sized packet fragmentation and both full-band and narrower-band modem
-frames with added noise and multipath. It cannot substitute for testing the
-chosen physical audio devices and acoustic path.
+variable-sized packet fragmentation and every data profile on full-band and
+narrower-band modem frames with added noise, multipath, and sample-clock error.
+It cannot substitute for testing the chosen physical audio devices and acoustic
+path.
 
 ## Project clarifications
 
@@ -152,10 +160,11 @@ chosen physical audio devices and acoustic path.
   dependency-free.
 - Networking uses TUN on Linux and utun on macOS. After automatic setup, normal
   client network traffic is routed through the gateway.
-- The initial robust profile uses repeated BPSK, a 2-6 kHz default band, and a
-  48 kHz sample rate for broad hardware compatibility. Faster modulation can be
-  added after the physical link is proven stable.
+- The link starts with 8x repeated BPSK and 16-byte frames in the 2-6 kHz default
+  band at a 48 kHz sample rate. It increases data density only after clean
+  acknowledged transfers and falls back as soon as a transaction is missed.
 - The initial implementation supports one client per gateway.
 - The initial link is unauthenticated and unencrypted.
 - Startup and operation log the selected input/output audio devices and useful
-  connection, negotiation, retry, tunnel, and traffic information.
+  connection, negotiation, active-profile, retry, tunnel, and continuously
+  measured upload/download throughput information.

@@ -23,6 +23,7 @@ typedef struct {
 typedef struct {
     packet_t packet;
     size_t offset;
+    size_t staged;
     uint16_t id;
     int active;
 } packet_sender_t;
@@ -42,7 +43,8 @@ int packet_queue_pop(packet_queue_t *queue, packet_t *packet);
 void packet_sender_init(packet_sender_t *sender);
 /* Stages (but does not commit) the next fragment. */
 size_t packet_sender_fragment(packet_sender_t *sender, packet_queue_t *queue,
-                              uint8_t out[MODEM_PAYLOAD_MAX]);
+                              uint8_t out[MODEM_PAYLOAD_MAX],
+                              size_t payload_limit);
 void packet_sender_commit(packet_sender_t *sender);
 
 void packet_receiver_init(packet_receiver_t *receiver);
