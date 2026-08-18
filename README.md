@@ -52,10 +52,10 @@ connection without IPv6 will naturally only provide working IPv4 service.
 
 The program logs its selected input and output devices, tunnel configuration,
 connection handshake, negotiated audio band, link transitions, retries,
-adaptive data profile, and acknowledged upload/download bytes per second.
-Startup also reports the deliberately long SF10 burst and retry timing so an
-initial robust transmission is not mistaken for a stalled process. Routine
-idle polls are intentionally not logged.
+modem timing/capacity, and acknowledged upload/download bytes per second.
+At the default band, startup reports a roughly 0.46-second control burst, a
+sub-second two-message handshake target, and the useful bit rate of a full data
+burst. Routine idle polls are intentionally not logged.
 
 The acoustic path is bidirectional: the client speaker must reach the gateway
 microphone, and the gateway speaker must reach the client microphone. While a
@@ -84,9 +84,9 @@ muted and logged as such rather than reported as missing input samples.
 --help                show command help
 ```
 
-The selected band must be at least 4 kHz wide. This keeps the longest SF10
-burst within the bounded audio buffers; the 2-12 kHz default gives the modem
-the largest processing bandwidth and is recommended.
+The selected band must be at least 4 kHz wide. This keeps a maximum data burst
+within the bounded audio buffers; the 2-12 kHz default gives the modem the
+largest processing bandwidth and is recommended.
 
 On Linux, `arecord -L` and `aplay -L` list usable ALSA names. The startup log
 resolves the selected PCM to its backing card/device when ALSA exposes that
@@ -107,23 +107,25 @@ privileges.
 
 ## How it works
 
-- 48 kHz mono audio using chirp spread spectrum (CSS) inside the negotiated
-  range. The default and bootstrap band is 2-12 kHz.
-- Discovery, handshake, and profile-control frames use SF10. Data also starts
-  in the deliberately slow `safe` profile (SF10 and 16-byte acoustic
-  fragments), then advances after eight clean data transactions through
-  `robust` (SF9/32), `balanced` (SF8/64), and `fast` (SF7/96).
-- Payload shifts use every eighth CSS bin. The guard bins absorb the small
-  peak shifts caused by speaker response, room echoes, and sample timing while
-  still letting lower spreading factors increase useful throughput.
-- A missed response immediately requests the next higher spreading factor and
-  retransmits the in-flight fragment without dropping the tunnel. Lost profile
-  acknowledgements are themselves retransmitted.
-- Rate-1/3 convolutional error correction repairs damaged symbols, while
-  CRC-32 rejects any frame that is still not exact.
-- Preamble timing and sample-clock estimation accommodate independent audio
-  clocks. Each chirp is tapered and the completed burst is band-limited before
-  playback to avoid sharp-boundary clicks and out-of-band crackle.
+- 48 kHz mono audio using continuous-phase SF7 chirp spread spectrum (CSS)
+  inside the negotiated range. The default and bootstrap band is 2-12 kHz.
+- A frame begins with three upchirps, two downchirps, and a sync chirp. The
+  up/down pair lets the receiver separate symbol timing error from carrier
+  frequency error instead of guessing symbol boundaries from quiet gaps.
+- Data uses 64 of the 128 CSS bins (six bits per symbol). The unused bin between
+  symbols prevents real-audio filtering and timing error from turning a
+  neighboring FFT peak into a different symbol.
+- The two-message handshake is `HELLO` followed by `OFFER`. Compact control
+  frames use rate-3/4 punctured convolutional coding; data uses rate-2/3 coding.
+  Control and data both include timing pilots, and data frames carry up to 128
+  payload bytes.
+- A 16-bit truncated CRC-32 protects compact control frames and full CRC-32
+  protects data frames after error correction. Frames that are still not exact
+  are discarded.
+- Timing pilots track independent audio sample clocks during a burst. The
+  carrier and chirp phase remain continuous across symbol boundaries, the
+  entire burst is faded only at its outer edges, and a final band-pass filter
+  limits playback energy to the requested band without per-symbol crackle.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
 - IP packets up to the 1280-byte tunnel MTU are fragmented across audio frames
@@ -134,10 +136,11 @@ privileges.
   keep each machine from decoding its own speaker echo as a peer frame.
 
 The five-second throughput report counts acknowledged IP payload bytes, not
-audio samples or protocol overhead. The link is designed for reliability and
-simplicity, not broadband speed. Actual throughput and error rate depend
-heavily on the microphones, speakers, room acoustics, volume, and selected
-band.
+audio samples or protocol overhead. At 2-12 kHz, a full one-way acoustic data
+burst carries about 226 useful bit/s before half-duplex request/response and
+idle-poll overhead. The link is designed for reliability and simplicity, not
+broadband speed. Actual tunnel throughput and error rate depend heavily on the
+microphones, speakers, room acoustics, volume, and selected band.
 
 ## Network layout
 
@@ -157,11 +160,12 @@ The audio link is deliberately unauthenticated and unencrypted. Anyone who can
 inject or receive the audio can participate in or observe the link. Use it only
 in an environment where that is acceptable.
 
-The gateway accepts one client at a time. The deterministic self-test exercises
-variable-sized packet fragmentation and every data profile on full-band and
-narrower-band modem frames with added noise, multipath, and sample-clock error.
-It cannot substitute for testing the chosen physical audio devices and acoustic
-path.
+The gateway accepts one client at a time. The deterministic self-test validates
+CSS algebra, every allowed symbol through the real passband path, preamble
+acquisition, error-correction corruption cases, packet fragmentation, the
+sub-second handshake budget, and complete frames with noise, four-path echoes,
+stream chunking, and ±200 ppm sample-clock error. It cannot substitute for
+testing the chosen physical audio devices and acoustic path.
 
 ## Project clarifications
 
@@ -174,10 +178,10 @@ path.
   dependency-free.
 - Networking uses TUN on Linux and utun on macOS. After automatic setup, normal
   client network traffic is routed through the gateway.
-- The link starts with SF10 CSS and 16-byte frames in the 2-12 kHz default band
-  at a 48 kHz sample rate. It walks down through SF9, SF8, and SF7 only after
-  clean acknowledged transfers and falls back as soon as a transaction is
-  missed.
+- The current reliability-first link uses fixed SF7 CSS in the 2-12 kHz default
+  band at a 48 kHz sample rate, guarded symbol bins, punctured convolutional
+  coding, CRCs, and timing pilots. Automatic density adaptation is intentionally
+  deferred until this baseline has been validated on real acoustic paths.
 - The initial implementation supports one client per gateway.
 - The initial link is unauthenticated and unencrypted.
 - Startup and operation log the selected input/output audio devices and useful

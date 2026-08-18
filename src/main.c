@@ -20,11 +20,10 @@
 #define FLAG_MORE 1u
 #define IDLE_POLL_MS 1000u
 #define LINK_TIMEOUT_MS 120000u
-#define TURNAROUND_MS 250u
-#define OUTPUT_TAIL_MS 180u
-#define HANDSHAKE_SETTLE_MS 2500u
+#define TURNAROUND_MS 30u
+#define OUTPUT_TAIL_MS 20u
+#define HANDSHAKE_SETTLE_MS 100u
 #define RATE_INTERVAL_MS 5000u
-#define PROMOTE_CLEAN_TRANSACTIONS 8u
 
 enum client_state { CLIENT_SEARCH, CLIENT_WAIT_READY, CLIENT_READY,
                     CLIENT_WAIT_RESPONSE, CLIENT_WAIT_PROFILE };
@@ -262,16 +261,15 @@ static uint64_t retry_delay(const app_t *app)
 {
     size_t burst = modem_burst_samples(app->selected_low,
                                        app->selected_high, app->profile);
-    /* A complete request and response, plus device and room latency. */
-    return 3000u + (uint64_t)burst * 2000u / AUDIO_SAMPLE_RATE;
+    /* The request has already played; allow one response plus margin. */
+    return 1000u + (uint64_t)burst * 1000u / AUDIO_SAMPLE_RATE;
 }
 
 static uint64_t bootstrap_retry_delay(void)
 {
-    size_t burst = modem_burst_samples(MODEM_MIN_HZ,
-                                       MODEM_BOOTSTRAP_MAX_HZ,
-                                       MODEM_PROFILE_SAFE);
-    return 3000u + (uint64_t)burst * 2000u / AUDIO_SAMPLE_RATE;
+    size_t burst = modem_control_burst_samples(MODEM_MIN_HZ,
+                                               MODEM_BOOTSTRAP_MAX_HZ);
+    return 500u + (uint64_t)burst * 1000u / AUDIO_SAMPLE_RATE;
 }
 
 static int set_data_profile(app_t *app, enum modem_profile profile)
@@ -358,7 +356,7 @@ static void send_hello(app_t *app)
     }
 }
 
-static void send_offer(app_t *app)
+static int send_offer(app_t *app)
 {
     modem_frame_t frame;
     memset(&frame, 0, sizeof(frame));
@@ -366,8 +364,11 @@ static void send_offer(app_t *app)
     frame.session = app->session;
     frame.band_low = (uint16_t)app->selected_low;
     frame.band_high = (uint16_t)app->selected_high;
-    if (send_frame(app, &frame, 1) == 0)
+    if (send_frame(app, &frame, 1) == 0) {
         app->next_action = milliseconds() + bootstrap_retry_delay();
+        return 0;
+    }
+    return -1;
 }
 
 static void send_confirm(app_t *app)
@@ -391,6 +392,39 @@ static void send_ready(app_t *app)
     frame.band_low = (uint16_t)app->selected_low;
     frame.band_high = (uint16_t)app->selected_high;
     (void)send_frame(app, &frame, 1);
+}
+
+static void activate_client_link(app_t *app, uint64_t now)
+{
+    app->client_state = CLIENT_READY;
+    app->sequence = 1;
+    app->next_action = now + HANDSHAKE_SETTLE_MS;
+    app->last_receive = now;
+    app->last_rate = now;
+    app->rate_bytes_sent = app->bytes_sent;
+    app->rate_bytes_received = app->bytes_received;
+    app->retries = 0;
+    log_line(app,
+             "link up (session %08x, SF%u, rate-2/3 FEC, %u-%u Hz); settling %u ms",
+             app->session, modem_profile_spreading_factor(app->profile),
+             app->selected_low, app->selected_high, HANDSHAKE_SETTLE_MS);
+}
+
+static void activate_gateway_link(app_t *app, uint64_t now)
+{
+    app->gateway_state = GATEWAY_CONNECTED;
+    app->sequence = 1;
+    app->last_gateway_sequence = 0;
+    app->last_receive = now;
+    app->cached_response_valid = 0;
+    app->last_rate = now;
+    app->rate_bytes_sent = app->bytes_sent;
+    app->rate_bytes_received = app->bytes_received;
+    packet_receiver_init(&app->receiver);
+    log_line(app,
+             "link up (session %08x, SF%u, rate-2/3 FEC, %u-%u Hz)",
+             app->session, modem_profile_spreading_factor(app->profile),
+             app->selected_low, app->selected_high);
 }
 
 static void send_profile_control(app_t *app, enum modem_profile profile,
@@ -491,25 +525,11 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
         }
         log_line(app, "gateway offer received; negotiated %u-%u Hz",
                  app->selected_low, app->selected_high);
-        send_confirm(app);
-        app->client_state = CLIENT_WAIT_READY;
-        app->retries = 0;
+        activate_client_link(app, now);
         return;
     }
     if (app->client_state == CLIENT_WAIT_READY && frame->type == MODEM_READY) {
-        app->client_state = CLIENT_READY;
-        app->sequence = 1;
-        app->next_action = now + HANDSHAKE_SETTLE_MS;
-        app->last_receive = now;
-        app->last_rate = now;
-        app->rate_bytes_sent = app->bytes_sent;
-        app->rate_bytes_received = app->bytes_received;
-        log_line(app,
-                 "link up (session %08x, %s profile: SF%u/%zu bytes, %u-%u Hz); settling %u ms",
-                 app->session, profile_name(app->profile),
-                 modem_profile_spreading_factor(app->profile),
-                 modem_profile_payload_limit(app->profile), app->selected_low,
-                 app->selected_high, HANDSHAKE_SETTLE_MS);
+        activate_client_link(app, now);
         return;
     }
     if (app->client_state == CLIENT_WAIT_PROFILE &&
@@ -593,13 +613,6 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
                             (frame->flags & FLAG_MORE))
                                ? now
                                : now + IDLE_POLL_MS;
-        if (carried_data &&
-            app->clean_transactions >= PROMOTE_CLEAN_TRANSACTIONS &&
-            app->profile < MODEM_PROFILE_FAST) {
-            begin_profile_change(
-                app, (enum modem_profile)(app->profile + 1), 0,
-                "clean transfer streak");
-        }
     }
 }
 
@@ -608,6 +621,7 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
     uint64_t now = milliseconds();
 
     if (frame->type == MODEM_HELLO) {
+        int establish = 0;
         unsigned low = frame->band_low > app->options.low_hz
                            ? frame->band_low : app->options.low_hz;
         unsigned high = frame->band_high < app->options.high_hz
@@ -630,8 +644,10 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
             packet_receiver_init(&app->receiver);
             log_line(app, "request heard (session %08x); offering %u-%u Hz",
                      app->session, low, high);
+            establish = 1;
         }
-        send_offer(app);
+        if (send_offer(app) == 0 && establish)
+            activate_gateway_link(app, milliseconds());
         return;
     }
     if (frame->session != app->session)
@@ -639,21 +655,7 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
     if (app->gateway_state == GATEWAY_WAIT_CONFIRM &&
         frame->type == MODEM_CONFIRM) {
         send_ready(app);
-        app->gateway_state = GATEWAY_CONNECTED;
-        app->sequence = 1;
-        app->last_gateway_sequence = 0;
-        app->last_receive = now;
-        app->cached_response_valid = 0;
-        app->last_rate = now;
-        app->rate_bytes_sent = app->bytes_sent;
-        app->rate_bytes_received = app->bytes_received;
-        packet_receiver_init(&app->receiver);
-        log_line(app,
-                 "link up (session %08x, %s profile: SF%u/%zu bytes, %u-%u Hz)",
-                 app->session, profile_name(app->profile),
-                 modem_profile_spreading_factor(app->profile),
-                 modem_profile_payload_limit(app->profile), app->selected_low,
-                 app->selected_high);
+        activate_gateway_link(app, now);
         return;
     }
     if (app->gateway_state == GATEWAY_CONNECTED &&
@@ -947,10 +949,9 @@ static void maybe_log_rate(app_t *app, uint64_t now)
                                    app->profile_attempts
                              : 100.0;
         log_line(app,
-                 "throughput: upload %.1f B/s, download %.1f B/s; %s profile, %.0f%% acknowledged, clean streak %u/%u",
+                 "throughput: upload %.1f B/s, download %.1f B/s; SF%u rate-2/3 FEC, %.0f%% acknowledged",
                  upload * 1000.0 / elapsed, download * 1000.0 / elapsed,
-                 profile_name(app->profile), success,
-                 app->clean_transactions, PROMOTE_CLEAN_TRANSACTIONS);
+                 modem_profile_spreading_factor(app->profile), success);
     }
     app->last_rate = now;
     app->rate_bytes_sent = app->bytes_sent;
@@ -1079,7 +1080,8 @@ static int run_app(const options_t *options)
     app_t app;
     char error[256];
     struct sigaction action;
-    size_t base_burst;
+    size_t base_burst, control_burst;
+    double useful_rate;
 
     memset(&app, 0, sizeof(app));
     app.options = *options;
@@ -1106,16 +1108,24 @@ static int run_app(const options_t *options)
     log_line(&app, "audio input:  %s", audio_input_name(app.audio));
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
     log_line(&app,
-             "audio format: mono 48 kHz; guarded-bin, convolutionally coded CSS; bootstrap/control SF10 at 2000-12000 Hz");
+             "audio format: mono 48 kHz; continuous-phase SF7 CSS; 64 guarded bins at 2000-12000 Hz");
     log_line(&app,
-             "data profiles: safe SF10/16 bytes -> robust SF9/32 -> balanced SF8/64 -> fast SF7/96");
+             "link coding: rate-3/4 control, rate-2/3 data; CRC and timing pilots; 128-byte frames");
     base_burst = modem_burst_samples(MODEM_MIN_HZ,
                                      MODEM_BOOTSTRAP_MAX_HZ,
                                      MODEM_PROFILE_SAFE);
+    control_burst = modem_control_burst_samples(MODEM_MIN_HZ,
+                                                MODEM_BOOTSTRAP_MAX_HZ);
+    useful_rate = (MODEM_PAYLOAD_MAX - 8u) * 8.0 * AUDIO_SAMPLE_RATE /
+                  base_burst;
     log_line(&app,
-             "base profile timing: bursts up to %.1f s; retry window %.1f s",
-             (double)base_burst / AUDIO_SAMPLE_RATE,
-             bootstrap_retry_delay() / 1000.0);
+             "modem timing: %.3f s control burst, %.3f s two-message handshake target",
+             (double)control_burst / AUDIO_SAMPLE_RATE,
+             2.0 * control_burst / AUDIO_SAMPLE_RATE +
+                 2.0 * TURNAROUND_MS / 1000.0);
+    log_line(&app,
+             "data capacity: %.1f useful bit/s per full acoustic burst (%.2f s)",
+             useful_rate, (double)base_burst / AUDIO_SAMPLE_RATE);
     log_line(&app,
              "half-duplex timing: %u ms turnaround; local transmit echo suppressed",
              TURNAROUND_MS);
@@ -1176,6 +1186,23 @@ fail:
     return 1;
 }
 
+static int protocol_timing_self_test(void)
+{
+    size_t control = modem_control_burst_samples(MODEM_MIN_HZ,
+                                                 MODEM_BOOTSTRAP_MAX_HZ);
+    double handshake = 2.0 * control / AUDIO_SAMPLE_RATE +
+                       2.0 * TURNAROUND_MS / 1000.0;
+
+    if (control == 0 || handshake >= 1.0) {
+        fprintf(stderr,
+                "protocol timing self-test failed: two-message handshake "
+                "takes %.3f s\n",
+                handshake);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     options_t options;
@@ -1191,6 +1218,10 @@ int main(int argc, char **argv)
         printf("ok\ntesting CSS codec... ");
         fflush(stdout);
         if (modem_self_test() != 0)
+            return 1;
+        printf("ok\ntesting protocol timing... ");
+        fflush(stdout);
+        if (protocol_timing_self_test() != 0)
             return 1;
         printf("ok\nall self-tests passed\n");
         return 0;
