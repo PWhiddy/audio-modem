@@ -355,7 +355,7 @@ static void client_frame(app_t *app, const modem_frame_t *frame)
         app->sequence = 1;
         app->next_action = now;
         app->last_receive = now;
-        log_line(app, "link up (session %08x, 16-QAM OFDM, %u-%u Hz)",
+        log_line(app, "link up (session %08x, QPSK OFDM, %u-%u Hz)",
                  app->session, app->selected_low, app->selected_high);
         return;
     }
@@ -412,7 +412,7 @@ static void gateway_frame(app_t *app, const modem_frame_t *frame)
         app->last_receive = now;
         app->cached_response_valid = 0;
         packet_receiver_init(&app->receiver);
-        log_line(app, "link up (session %08x, 16-QAM OFDM, %u-%u Hz)",
+        log_line(app, "link up (session %08x, QPSK OFDM, %u-%u Hz)",
                  app->session, app->selected_low, app->selected_high);
         return;
     }
@@ -750,7 +750,8 @@ static int run_app(const options_t *options)
     }
     log_line(&app, "audio input:  %s", audio_input_name(app.audio));
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
-    log_line(&app, "audio format: mono 48 kHz; bootstrap band 2000-12000 Hz");
+    log_line(&app,
+             "audio format: mono 48 kHz; QPSK OFDM; bootstrap band 2000-12000 Hz");
 
     if (tunnel_open(&app.tunnel, options->gateway, options->configure,
                     error, sizeof(error)) != 0) {
@@ -819,7 +820,7 @@ int main(int argc, char **argv)
         fflush(stdout);
         if (packet_self_test() != 0)
             return 1;
-        printf("ok\ntesting 16-QAM OFDM codec... ");
+        printf("ok\ntesting QPSK OFDM codec... ");
         fflush(stdout);
         if (modem_self_test() != 0)
             return 1;

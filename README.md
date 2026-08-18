@@ -98,9 +98,11 @@ privileges.
 
 - 48 kHz mono audio, with active OFDM carriers inside the negotiated 2-12 kHz
   range.
-- 16-QAM data carriers, BPSK pilots and training symbols, cyclic prefixes, and
-  per-burst channel/phase estimation. Pilot tracking compensates for small
+- QPSK (4-QAM) data carriers, BPSK pilots and training symbols, cyclic prefixes,
+  and per-burst channel/phase estimation. Pilot tracking compensates for small
   sample-clock differences between independent audio devices.
+- Handshake messages and empty link polls use a compact independently coded
+  frame, while frames carrying IP fragments use the full payload format.
 - Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
@@ -148,7 +150,7 @@ chosen physical audio devices and acoustic path.
   dependency-free.
 - Networking uses TUN on Linux and utun on macOS. After automatic setup, normal
   client network traffic is routed through the gateway.
-- The modem uses 16-QAM and a 48 kHz sample rate for broad hardware
+- The modem uses QPSK (4-QAM) and a 48 kHz sample rate for broad hardware
   compatibility.
 - The initial implementation supports one client per gateway.
 - The initial link is unauthenticated and unencrypted.
