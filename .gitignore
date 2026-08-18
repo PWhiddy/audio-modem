@@ -1,0 +1,4 @@
+audio-modem
+src/*.o
+src/*.d
+*.core
