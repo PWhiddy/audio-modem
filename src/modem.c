@@ -21,6 +21,7 @@
 #define CODE_STEPS (RAW_BITS + 6u)
 #define CODE_BITS (CODE_STEPS * 2u)
 #define BITS_PER_CARRIER 2u
+#define CONTROL_REPETITIONS 2u
 #define RX_CAPACITY (AUDIO_SAMPLE_RATE * 6u)
 #define PI 3.14159265358979323846
 
@@ -116,17 +117,23 @@ static int make_band(unsigned low_hz, unsigned high_hz, band_t *band)
     return 0;
 }
 
-static unsigned symbols_for_bits(const band_t *band, size_t bits)
+static unsigned symbols_for_bits(const band_t *band, size_t bits,
+                                 unsigned bits_per_carrier)
 {
-    size_t bits_per_symbol = band->data_carriers * BITS_PER_CARRIER;
+    size_t bits_per_symbol = band->data_carriers * bits_per_carrier;
     return (unsigned)((bits + bits_per_symbol - 1u) / bits_per_symbol);
 }
 
 static size_t samples_for_raw(const band_t *band, size_t raw_length)
 {
     size_t code_bits = (raw_length * 8u + 6u) * 2u;
+    int control = raw_length == CONTROL_RAW_N;
+    size_t transmitted_bits =
+        code_bits * (control ? CONTROL_REPETITIONS : 1u);
     return 2u * SYMBOL_N +
-           (size_t)symbols_for_bits(band, code_bits) * SYMBOL_N;
+           (size_t)symbols_for_bits(band, transmitted_bits,
+                                    control ? 1u : BITS_PER_CARRIER) *
+               SYMBOL_N;
 }
 
 static int is_pilot(const band_t *band, unsigned bin)
@@ -336,7 +343,9 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
     uint8_t raw[RAW_N], code[CODE_BITS];
     float training[SYMBOL_N];
     float *output;
-    size_t raw_length, code_bits, total, position, code_pos = 0;
+    size_t raw_length, code_bits, transmitted_bits, total, position;
+    size_t code_pos = 0;
+    int control;
     unsigned symbols;
     unsigned symbol, k;
     double peak = 0.0;
@@ -346,9 +355,12 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
         make_band(low_hz, high_hz, &band) != 0)
         return -1;
     serialize_frame(frame, raw);
-    raw_length = frame->payload_len == 0 ? CONTROL_RAW_N : RAW_N;
+    control = frame->payload_len == 0;
+    raw_length = control ? CONTROL_RAW_N : RAW_N;
     code_bits = convolutional_encode(raw, raw_length, code);
-    symbols = symbols_for_bits(&band, code_bits);
+    transmitted_bits = code_bits * (control ? CONTROL_REPETITIONS : 1u);
+    symbols = symbols_for_bits(&band, transmitted_bits,
+                               control ? 1u : BITS_PER_CARRIER);
     total = LEAD_N + 2u * SYMBOL_N + (size_t)symbols * SYMBOL_N + TAIL_N;
     output = calloc(total, sizeof(*output));
     if (!output)
@@ -367,6 +379,13 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
             double complex value;
             if (is_pilot(&band, k)) {
                 value = pn_value(k, symbol + 1u);
+            } else if (control) {
+                unsigned bit = 0;
+                if (code_pos < transmitted_bits) {
+                    bit = code[code_pos % code_bits];
+                    ++code_pos;
+                }
+                value = bit ? 1.0 : -1.0;
             } else {
                 unsigned bits[2] = {0, 0};
                 unsigned b;
@@ -434,12 +453,17 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
     float llr[CODE_BITS];
     uint8_t raw[RAW_N];
     size_t code_bits = (raw_length * 8u + 6u) * 2u;
-    size_t llr_pos = 0;
+    int control = raw_length == CONTROL_RAW_N;
+    size_t transmitted_bits =
+        code_bits * (control ? CONTROL_REPETITIONS : 1u);
+    size_t bit_pos = 0;
     long sample_adjustment = 0;
-    unsigned symbols = symbols_for_bits(band, code_bits);
+    unsigned symbols = symbols_for_bits(band, transmitted_bits,
+                                        control ? 1u : BITS_PER_CARRIER);
     unsigned training_index, symbol, k;
 
     memset(channel, 0, sizeof(channel));
+    memset(llr, 0, sizeof(llr));
     for (training_index = 0; training_index < 2u; ++training_index) {
         double complex time[FFT_N];
         size_t base = start + training_index * SYMBOL_N + CP_N;
@@ -496,7 +520,7 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
                        : 1.0;
         for (k = band->low_bin; k <= band->high_bin; ++k) {
             double complex value;
-            if (is_pilot(band, k) || llr_pos >= code_bits)
+            if (is_pilot(band, k) || bit_pos >= transmitted_bits)
                 continue;
             if (cabs(channel[k]) < 1.0e-8)
                 value = 0.0;
@@ -505,8 +529,13 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
                 value = time[k] / channel[k] *
                         (cos(angle) + I * sin(angle)) * rotation;
             }
-            llr[llr_pos++] = (float)creal(value);
-            llr[llr_pos++] = (float)cimag(value);
+            if (control) {
+                llr[bit_pos % code_bits] += (float)creal(value);
+                ++bit_pos;
+            } else {
+                llr[bit_pos++] = (float)creal(value);
+                llr[bit_pos++] = (float)cimag(value);
+            }
         }
         if (timing <= -0.5 || timing >= 0.5) {
             sample_adjustment += lround(timing);
@@ -516,7 +545,7 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
                 sample_adjustment = (long)DETECT_LOOKAHEAD;
         }
     }
-    if (llr_pos != code_bits ||
+    if (bit_pos != transmitted_bits ||
         convolutional_decode(llr, raw_length, raw) != 0)
         return -1;
     return parse_frame(raw, raw_length, frame);
@@ -762,6 +791,8 @@ static int test_clock_mismatch(double ratio, int control)
     float *encoded = NULL, *channel = NULL;
     size_t encoded_count = 0, resampled_count, channel_count, i, position;
     uint32_t random = 23;
+    unsigned phy_high =
+        control ? MODEM_BOOTSTRAP_MAX_HZ : MODEM_DEFAULT_MAX_HZ;
     int got = 0;
 
     memset(&sent, 0, sizeof(sent));
@@ -773,13 +804,13 @@ static int test_clock_mismatch(double ratio, int control)
     sent.payload_len = control ? 0 : MODEM_PAYLOAD_MAX;
     for (i = 0; i < sent.payload_len; ++i)
         sent.payload[i] = (uint8_t)test_random(&random);
-    if (modem_encode(&sent, MODEM_MIN_HZ, MODEM_MAX_HZ, &encoded,
+    if (modem_encode(&sent, MODEM_MIN_HZ, phy_high, &encoded,
                      &encoded_count) != 0)
         goto done;
     resampled_count = (size_t)(encoded_count * ratio);
     channel_count = 137u + resampled_count + 17u + 257u;
     channel = calloc(channel_count, sizeof(*channel));
-    decoder = modem_decoder_create(MODEM_MIN_HZ, MODEM_MAX_HZ);
+    decoder = modem_decoder_create(MODEM_MIN_HZ, phy_high);
     if (!channel || !decoder)
         goto done;
     for (i = 0; i < channel_count; ++i) {
@@ -906,6 +937,7 @@ done:
 int modem_self_test(void)
 {
     if (test_one_band(MODEM_MIN_HZ, MODEM_MAX_HZ) != 0 ||
+        test_one_band(MODEM_MIN_HZ, MODEM_DEFAULT_MAX_HZ) != 0 ||
         test_one_band(3500u, 8500u) != 0 ||
         test_clock_mismatch(0.998, 0) != 0 ||
         test_clock_mismatch(1.002, 0) != 0 ||

@@ -21,8 +21,8 @@
 #define SEARCH_MS 3000u
 #define IDLE_POLL_MS 1000u
 #define LINK_TIMEOUT_MS 12000u
-#define TURNAROUND_MS 150u
-#define OUTPUT_TAIL_MS 100u
+#define TURNAROUND_MS 250u
+#define OUTPUT_TAIL_MS 180u
 
 enum client_state { CLIENT_SEARCH, CLIENT_WAIT_READY, CLIENT_READY,
                     CLIENT_WAIT_RESPONSE };
@@ -143,7 +143,7 @@ static void usage(FILE *stream, const char *program)
         "  --gateway             share this machine's internet connection\n"
         "\n"
         "Options:\n"
-        "  --band LOW:HIGH       requested audio band in Hz (default 2000:12000)\n"
+        "  --band LOW:HIGH       requested audio band in Hz (default 2000:8000)\n"
         "  --input DEVICE        ALSA name or CoreAudio device UID\n"
         "  --output DEVICE       ALSA name or CoreAudio device UID\n"
         "  --no-config           create TUN/utun but do not alter routes or NAT\n"
@@ -159,7 +159,7 @@ static int parse_options(int argc, char **argv, options_t *options,
     memset(options, 0, sizeof(*options));
     options->configure = 1;
     options->low_hz = MODEM_MIN_HZ;
-    options->high_hz = MODEM_MAX_HZ;
+    options->high_hz = MODEM_DEFAULT_MAX_HZ;
     *self_test = 0;
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--client") == 0)
@@ -201,7 +201,7 @@ static int send_frame(app_t *app, const modem_frame_t *frame, int bootstrap)
         TURNAROUND_MS / 1000u,
         (long)(TURNAROUND_MS % 1000u) * 1000000L};
     unsigned low = bootstrap ? MODEM_MIN_HZ : app->selected_low;
-    unsigned high = bootstrap ? MODEM_MAX_HZ : app->selected_high;
+    unsigned high = bootstrap ? MODEM_BOOTSTRAP_MAX_HZ : app->selected_high;
 
     if (modem_encode(frame, low, high, &samples, &count) != 0) {
         log_line(app, "cannot encode audio frame");
@@ -244,7 +244,7 @@ static int set_link_band(app_t *app, unsigned low, unsigned high)
     app->selected_high = high;
     app->link_decoder_enabled = 1;
     app->link_matches_bootstrap =
-        low == MODEM_MIN_HZ && high == MODEM_MAX_HZ;
+        low == MODEM_MIN_HZ && high == MODEM_BOOTSTRAP_MAX_HZ;
     return 0;
 }
 
@@ -310,7 +310,7 @@ static void send_confirm(app_t *app)
     frame.session = app->session;
     frame.band_low = (uint16_t)app->selected_low;
     frame.band_high = (uint16_t)app->selected_high;
-    if (send_frame(app, &frame, 0) == 0)
+    if (send_frame(app, &frame, 1) == 0)
         app->next_action = milliseconds() + retry_delay(app);
 }
 
@@ -322,7 +322,7 @@ static void send_ready(app_t *app)
     frame.session = app->session;
     frame.band_low = (uint16_t)app->selected_low;
     frame.band_high = (uint16_t)app->selected_high;
-    (void)send_frame(app, &frame, 0);
+    (void)send_frame(app, &frame, 1);
 }
 
 static void deliver_fragment(app_t *app, const modem_frame_t *frame)
@@ -758,7 +758,8 @@ static int run_app(const options_t *options)
     packet_queue_init(&app.outbound);
     packet_sender_init(&app.sender);
     packet_receiver_init(&app.receiver);
-    app.bootstrap_decoder = modem_decoder_create(MODEM_MIN_HZ, MODEM_MAX_HZ);
+    app.bootstrap_decoder =
+        modem_decoder_create(MODEM_MIN_HZ, MODEM_BOOTSTRAP_MAX_HZ);
     app.link_decoder = modem_decoder_create(options->low_hz, options->high_hz);
     if (!app.bootstrap_decoder || !app.link_decoder) {
         fprintf(stderr, "cannot allocate modem decoder\n");
@@ -771,7 +772,7 @@ static int run_app(const options_t *options)
     log_line(&app, "audio input:  %s", audio_input_name(app.audio));
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
     log_line(&app,
-             "audio format: mono 48 kHz; QPSK OFDM; bootstrap band 2000-12000 Hz");
+             "audio format: mono 48 kHz; QPSK data, repeated-BPSK control; bootstrap band 2000-6000 Hz");
     log_line(&app,
              "half-duplex timing: %u ms turnaround; local transmit echo suppressed",
              TURNAROUND_MS);
@@ -843,7 +844,7 @@ int main(int argc, char **argv)
         fflush(stdout);
         if (packet_self_test() != 0)
             return 1;
-        printf("ok\ntesting QPSK OFDM codec... ");
+        printf("ok\ntesting OFDM codec... ");
         fflush(stdout);
         if (modem_self_test() != 0)
             return 1;

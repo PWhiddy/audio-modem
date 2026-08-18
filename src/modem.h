@@ -6,6 +6,8 @@
 
 #define MODEM_MIN_HZ 2000u
 #define MODEM_MAX_HZ 12000u
+#define MODEM_BOOTSTRAP_MAX_HZ 6000u
+#define MODEM_DEFAULT_MAX_HZ 8000u
 #define MODEM_PAYLOAD_MAX 384u
 
 enum modem_frame_type {

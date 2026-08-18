@@ -69,7 +69,7 @@ peaks near 0 dBFS because those indicate clipping.
 ```text
 --client              run as the client (default)
 --gateway             run as the internet gateway
---band LOW:HIGH       requested band in Hz (default 2000:12000)
+--band LOW:HIGH       requested band in Hz (default 2000:8000)
 --input DEVICE        ALSA device name or CoreAudio device UID
 --output DEVICE       ALSA device name or CoreAudio device UID
 --no-config           do not install addresses, routes, forwarding, or NAT
@@ -87,8 +87,8 @@ through `sudo`, audio-modem connects to the invoking desktop user's sound server
 while retaining the privileges needed for TUN and network setup; no PulseAudio
 environment variables need to be passed through `sudo`. The defaults are
 normally best on both platforms. The client and gateway may request different
-bands; the handshake selects their overlap. Initial discovery always uses the
-full 2-12 kHz bootstrap band.
+bands; the handshake selects their overlap. Initial discovery and handshake
+use a fixed, robust 2-6 kHz bootstrap band.
 
 `--no-config` is intended for development and custom network setups. It still
 creates the TUN/utun device and therefore normally still requires elevated
@@ -101,8 +101,8 @@ privileges.
 - QPSK (4-QAM) data carriers, BPSK pilots and training symbols, cyclic prefixes,
   and per-burst channel/phase estimation. Pilot tracking compensates for small
   sample-clock differences between independent audio devices.
-- Handshake messages and empty link polls use a compact independently coded
-  frame, while frames carrying IP fragments use the full payload format.
+- Handshake messages and empty link polls use a compact BPSK frame with every
+  coded bit sent twice, while frames carrying IP fragments use QPSK.
 - Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
