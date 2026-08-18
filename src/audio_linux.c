@@ -24,6 +24,13 @@ typedef long (*pcm_writei_fn)(void *, const void *, unsigned long);
 typedef int (*pcm_recover_fn)(void *, int, int);
 typedef const char *(*strerror_fn)(int);
 typedef const char *(*pcm_name_fn)(void *);
+typedef int (*pcm_info_malloc_fn)(void **);
+typedef void (*pcm_info_free_fn)(void *);
+typedef int (*pcm_info_fn)(void *, void *);
+typedef const char *(*pcm_info_name_fn)(const void *);
+typedef int (*pcm_info_card_fn)(const void *);
+typedef unsigned (*pcm_info_device_fn)(const void *);
+typedef int (*card_name_fn)(int, char **);
 
 struct audio {
     void *library;
@@ -47,8 +54,8 @@ struct audio {
     float tx[RING_N];
     size_t tx_head;
     size_t tx_count;
-    char input_name[128];
-    char output_name[128];
+    char input_name[256];
+    char output_name[256];
 };
 
 static void set_error(char *err, size_t size, const char *operation,
@@ -61,6 +68,57 @@ static void set_error(char *err, size_t size, const char *operation,
 static void *load_symbol(void *library, const char *name)
 {
     return dlsym(library, name);
+}
+
+static void describe_pcm(char *out, size_t out_size, const char *configured,
+                         void *pcm, pcm_name_fn pcm_name,
+                         pcm_info_malloc_fn info_malloc,
+                         pcm_info_free_fn info_free, pcm_info_fn get_info,
+                         pcm_info_name_fn info_name,
+                         pcm_info_card_fn info_card,
+                         pcm_info_device_fn info_device,
+                         card_name_fn card_name)
+{
+    void *info = NULL;
+    const char *pcm_description = NULL;
+    char *card_description = NULL;
+    int card = -1;
+    unsigned device = 0;
+
+    if (info_malloc && info_free && get_info && info_name && info_card &&
+        info_device && info_malloc(&info) == 0) {
+        if (get_info(pcm, info) == 0) {
+            pcm_description = info_name(info);
+            card = info_card(info);
+            device = info_device(info);
+            if (card >= 0 && card_name)
+                (void)card_name(card, &card_description);
+        }
+    }
+    if (pcm_description && *pcm_description) {
+        if (card >= 0 && card_description && *card_description &&
+            strcmp(card_description, pcm_description) != 0)
+            snprintf(out, out_size, "%s -> %s / %s (ALSA card %d, device %u)",
+                     configured, card_description, pcm_description, card,
+                     device);
+        else if (card >= 0)
+            snprintf(out, out_size, "%s -> %s (ALSA card %d, device %u)",
+                     configured, pcm_description, card, device);
+        else
+            snprintf(out, out_size, "%s -> %s (ALSA virtual PCM)", configured,
+                     pcm_description);
+    } else {
+        const char *identifier = pcm_name(pcm);
+        snprintf(out, out_size, "%s (ALSA%s%s)",
+                 identifier ? identifier : configured,
+                 strcmp(configured, "default") == 0 ? " default route" : "",
+                 strcmp(configured, "default") == 0
+                     ? "; backing device not exposed"
+                     : "");
+    }
+    free(card_description);
+    if (info)
+        info_free(info);
 }
 
 static void *capture_main(void *argument)
@@ -138,6 +196,13 @@ int audio_open(audio_t **out, const char *input_device,
     pcm_open_fn pcm_open;
     pcm_set_params_fn pcm_set_params;
     pcm_name_fn pcm_name;
+    pcm_info_malloc_fn info_malloc;
+    pcm_info_free_fn info_free;
+    pcm_info_fn get_info;
+    pcm_info_name_fn info_name;
+    pcm_info_card_fn info_card;
+    pcm_info_device_fn info_device;
+    card_name_fn card_name;
     int status;
 
     if (!out)
@@ -174,6 +239,16 @@ int audio_open(audio_t **out, const char *input_device,
     LOAD(audio->error_string, "snd_strerror");
     LOAD(pcm_name, "snd_pcm_name");
 #undef LOAD
+#define LOAD_OPTIONAL(member, symbol)                                           \
+    (*(void **)(&(member)) = load_symbol(audio->library, symbol))
+    LOAD_OPTIONAL(info_malloc, "snd_pcm_info_malloc");
+    LOAD_OPTIONAL(info_free, "snd_pcm_info_free");
+    LOAD_OPTIONAL(get_info, "snd_pcm_info");
+    LOAD_OPTIONAL(info_name, "snd_pcm_info_get_name");
+    LOAD_OPTIONAL(info_card, "snd_pcm_info_get_card");
+    LOAD_OPTIONAL(info_device, "snd_pcm_info_get_device");
+    LOAD_OPTIONAL(card_name, "snd_card_get_name");
+#undef LOAD_OPTIONAL
 
     if (!input_device)
         input_device = "default";
@@ -206,14 +281,12 @@ int audio_open(audio_t **out, const char *input_device,
         audio_close(audio);
         return -1;
     }
-    {
-        const char *actual_input = pcm_name(audio->capture);
-        const char *actual_output = pcm_name(audio->playback);
-        snprintf(audio->input_name, sizeof(audio->input_name), "%s (ALSA)",
-                 actual_input ? actual_input : input_device);
-        snprintf(audio->output_name, sizeof(audio->output_name), "%s (ALSA)",
-                 actual_output ? actual_output : output_device);
-    }
+    describe_pcm(audio->input_name, sizeof(audio->input_name), input_device,
+                 audio->capture, pcm_name, info_malloc, info_free, get_info,
+                 info_name, info_card, info_device, card_name);
+    describe_pcm(audio->output_name, sizeof(audio->output_name), output_device,
+                 audio->playback, pcm_name, info_malloc, info_free, get_info,
+                 info_name, info_card, info_device, card_name);
     if (pthread_create(&audio->capture_thread, NULL, capture_main, audio) != 0) {
         set_error(err, err_size, "audio", "cannot start capture thread");
         audio_close(audio);

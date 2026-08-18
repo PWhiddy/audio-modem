@@ -4,6 +4,9 @@
 #include "tunnel.h"
 
 #include <errno.h>
+#ifdef __linux__
+#include <pwd.h>
+#endif
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -571,6 +574,107 @@ static void maybe_log_stats(app_t *app, uint64_t now)
                  (unsigned long long)app->dropped_packets);
 }
 
+#ifdef __linux__
+static int user_audio_device(const char *name)
+{
+    return !name || strcmp(name, "default") == 0 ||
+           strcmp(name, "pulse") == 0;
+}
+
+static int sudo_identity(uid_t *uid, gid_t *gid, struct passwd **account)
+{
+    const char *uid_text = getenv("SUDO_UID");
+    const char *gid_text = getenv("SUDO_GID");
+    char *end;
+    unsigned long value;
+
+    if (geteuid() != 0 || !uid_text || !gid_text)
+        return 0;
+    errno = 0;
+    value = strtoul(uid_text, &end, 10);
+    if (errno || !*uid_text || *end || (uid_t)value != value || value == 0)
+        return 0;
+    *uid = (uid_t)value;
+    errno = 0;
+    value = strtoul(gid_text, &end, 10);
+    if (errno || !*gid_text || *end || (gid_t)value != value)
+        return 0;
+    *gid = (gid_t)value;
+    *account = getpwuid(*uid);
+    return *account != NULL;
+}
+
+static int audio_open_for_app(app_t *app, char *err, size_t err_size)
+{
+    uid_t uid;
+    gid_t gid;
+    struct passwd *account;
+    char runtime[128], server[160], cookie[512];
+    int result, saved_errno;
+
+    if ((!user_audio_device(app->options.input_device) &&
+         !user_audio_device(app->options.output_device)) ||
+        !sudo_identity(&uid, &gid, &account))
+        return audio_open(&app->audio, app->options.input_device,
+                          app->options.output_device, err, err_size);
+
+    snprintf(runtime, sizeof(runtime), "/run/user/%lu", (unsigned long)uid);
+    snprintf(server, sizeof(server), "unix:%s/pulse/native", runtime);
+    snprintf(cookie, sizeof(cookie), "%s/.config/pulse/cookie",
+             account->pw_dir);
+    (void)setenv("HOME", account->pw_dir, 1);
+    (void)setenv("USER", account->pw_name, 1);
+    (void)setenv("LOGNAME", account->pw_name, 1);
+    (void)setenv("XDG_RUNTIME_DIR", runtime, 1);
+    (void)setenv("PULSE_SERVER", server, 1);
+    if (access(cookie, R_OK) == 0)
+        (void)setenv("PULSE_COOKIE", cookie, 1);
+
+    log_line(app, "opening desktop audio as %s (uid %lu)", account->pw_name,
+             (unsigned long)uid);
+    if (setegid(gid) != 0) {
+        saved_errno = errno;
+        if (err && err_size)
+            snprintf(err, err_size, "cannot assume invoking user's audio identity: %s",
+                     strerror(saved_errno));
+        return -1;
+    }
+    if (seteuid(uid) != 0) {
+        saved_errno = errno;
+        if (setegid(0) != 0) {
+            if (err && err_size)
+                snprintf(err, err_size,
+                         "cannot assume invoking user's audio identity or restore group privileges");
+        } else if (err && err_size) {
+            snprintf(err, err_size,
+                     "cannot assume invoking user's audio identity: %s",
+                     strerror(saved_errno));
+        }
+        return -1;
+    }
+    result = audio_open(&app->audio, app->options.input_device,
+                        app->options.output_device, err, err_size);
+    saved_errno = errno;
+    if (seteuid(0) != 0 || setegid(0) != 0) {
+        if (app->audio) {
+            audio_close(app->audio);
+            app->audio = NULL;
+        }
+        if (err && err_size)
+            snprintf(err, err_size, "cannot restore administrative privileges");
+        return -1;
+    }
+    errno = saved_errno;
+    return result;
+}
+#else
+static int audio_open_for_app(app_t *app, char *err, size_t err_size)
+{
+    return audio_open(&app->audio, app->options.input_device,
+                      app->options.output_device, err, err_size);
+}
+#endif
+
 static int run_app(const options_t *options)
 {
     app_t app;
@@ -594,8 +698,7 @@ static int run_app(const options_t *options)
         fprintf(stderr, "cannot allocate modem decoder\n");
         goto fail;
     }
-    if (audio_open(&app.audio, options->input_device, options->output_device,
-                   error, sizeof(error)) != 0) {
+    if (audio_open_for_app(&app, error, sizeof(error)) != 0) {
         fprintf(stderr, "%s\n", error);
         goto fail;
     }

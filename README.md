@@ -67,7 +67,15 @@ periodic packet counters. Routine idle polls are intentionally not logged.
 --help                show command help
 ```
 
-On Linux, `arecord -L` and `aplay -L` list usable ALSA names. The defaults are
+On Linux, `arecord -L` and `aplay -L` list usable ALSA names. The startup log
+resolves the selected PCM to its backing card/device when ALSA exposes that
+information. PipeWire or PulseAudio may intentionally expose only a virtual
+default; `wpctl status` or `pactl list short sources` / `sinks` then shows which
+physical endpoints that sound server currently routes to. Use `--input pulse
+--output pulse` to select the current PulseAudio defaults explicitly. When run
+through `sudo`, audio-modem connects to the invoking desktop user's sound server
+while retaining the privileges needed for TUN and network setup; no PulseAudio
+environment variables need to be passed through `sudo`. The defaults are
 normally best on both platforms. The client and gateway may request different
 bands; the handshake selects their overlap. Initial discovery always uses the
 full 2-12 kHz bootstrap band.
