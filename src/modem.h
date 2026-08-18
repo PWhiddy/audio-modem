@@ -31,6 +31,12 @@ typedef struct {
 
 typedef struct modem_decoder modem_decoder_t;
 
+typedef struct {
+    double peak_sync;
+    unsigned candidates;
+    unsigned rejected;
+} modem_activity_t;
+
 modem_decoder_t *modem_decoder_create(unsigned low_hz, unsigned high_hz);
 void modem_decoder_destroy(modem_decoder_t *decoder);
 int modem_decoder_set_band(modem_decoder_t *decoder, unsigned low_hz,
@@ -38,6 +44,9 @@ int modem_decoder_set_band(modem_decoder_t *decoder, unsigned low_hz,
 /* Returns 1 with a frame, 0 when more samples are needed, and -1 on overflow. */
 int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
                        size_t count, modem_frame_t *frame);
+/* Returns and clears receive activity accumulated since the previous call. */
+void modem_decoder_take_activity(modem_decoder_t *decoder,
+                                 modem_activity_t *activity);
 
 int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
                  float **samples, size_t *count);

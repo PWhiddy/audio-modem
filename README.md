@@ -54,6 +54,16 @@ The program logs its selected input and output devices, tunnel configuration,
 connection handshake, negotiated audio band, link transitions, retries, and
 periodic packet counters. Routine idle polls are intentionally not logged.
 
+The acoustic path is bidirectional: the client speaker must reach the gateway
+microphone, and the gateway speaker must reach the client microphone. While a
+side is waiting for the handshake, it reports its input RMS/peak level and best
+modem-sync score every five seconds. A score near zero means the selected
+microphone is not hearing a recognizable burst. A score approaching `0.55`
+means the burst is recognizable; `candidate frame rejected` means it found the
+OFDM preamble but the frame was too damaged to pass error correction and CRC.
+Move the relevant microphone closer or adjust output/input gain, while avoiding
+peaks near 0 dBFS because those indicate clipping.
+
 ## Options
 
 ```text
@@ -89,7 +99,8 @@ privileges.
 - 48 kHz mono audio, with active OFDM carriers inside the negotiated 2-12 kHz
   range.
 - 16-QAM data carriers, BPSK pilots and training symbols, cyclic prefixes, and
-  per-burst channel/phase estimation.
+  per-burst channel/phase estimation. Pilot tracking compensates for small
+  sample-clock differences between independent audio devices.
 - Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.

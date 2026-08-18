@@ -7,6 +7,7 @@
 #ifdef __linux__
 #include <pwd.h>
 #endif
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -65,6 +66,10 @@ typedef struct {
     uint64_t dropped_packets;
     uint64_t retries_sent;
     uint64_t last_stats;
+    double input_square_sum;
+    float input_peak;
+    uint64_t input_samples;
+    uint64_t next_audio_status;
 } app_t;
 
 static volatile sig_atomic_t stopping;
@@ -477,10 +482,51 @@ static void pump_audio(app_t *app)
     size_t count;
     while ((count = audio_read(app->audio, samples,
                                sizeof(samples) / sizeof(samples[0]))) != 0) {
+        size_t i;
+        for (i = 0; i < count; ++i) {
+            float absolute = fabsf(samples[i]);
+            app->input_square_sum += (double)samples[i] * samples[i];
+            if (absolute > app->input_peak)
+                app->input_peak = absolute;
+        }
+        app->input_samples += count;
         pump_decoder(app, app->bootstrap_decoder, samples, count);
         if (app->link_decoder_enabled && !app->link_matches_bootstrap)
             pump_decoder(app, app->link_decoder, samples, count);
     }
+}
+
+static void maybe_log_audio_status(app_t *app, uint64_t now)
+{
+    modem_activity_t activity;
+    int connecting;
+
+    if (now < app->next_audio_status)
+        return;
+    app->next_audio_status = now + 5000u;
+    modem_decoder_take_activity(app->bootstrap_decoder, &activity);
+    connecting = app->options.gateway
+                     ? app->gateway_state != GATEWAY_CONNECTED
+                     : app->client_state != CLIENT_READY &&
+                           app->client_state != CLIENT_WAIT_RESPONSE;
+    if (connecting) {
+        if (app->input_samples) {
+            double rms = sqrt(app->input_square_sum / app->input_samples);
+            double rms_db = 20.0 * log10(rms > 1.0e-6 ? rms : 1.0e-6);
+            double peak_db = 20.0 * log10(app->input_peak > 1.0e-6f
+                                              ? app->input_peak
+                                              : 1.0e-6f);
+            log_line(app,
+                     "input level: %.0f dBFS RMS, %.0f dBFS peak; best modem sync %.2f%s",
+                     rms_db, peak_db, activity.peak_sync,
+                     activity.rejected ? "; candidate frame rejected" : "");
+        } else {
+            log_line(app, "audio input produced no samples");
+        }
+    }
+    app->input_square_sum = 0.0;
+    app->input_peak = 0.0f;
+    app->input_samples = 0;
 }
 
 static void pump_tunnel(app_t *app)
@@ -731,6 +777,7 @@ static int run_app(const options_t *options)
         log_line(&app, "searching for an audio gateway");
     }
     app.last_stats = milliseconds();
+    app.next_audio_status = app.last_stats + 5000u;
     while (!stopping) {
         struct timespec pause = {0, 10000000};
         uint64_t now;
@@ -741,6 +788,7 @@ static int run_app(const options_t *options)
             gateway_tick(&app, now);
         else
             client_tick(&app, now);
+        maybe_log_audio_status(&app, now);
         maybe_log_stats(&app, now);
         nanosleep(&pause, NULL);
     }

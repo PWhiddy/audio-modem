@@ -34,6 +34,9 @@ struct modem_decoder {
     float *rx;
     size_t length;
     size_t search_position;
+    double peak_sync;
+    unsigned candidates;
+    unsigned rejected;
 };
 
 static uint16_t get_u16(const uint8_t *p)
@@ -187,6 +190,7 @@ static void training_symbol(const band_t *band, float output[SYMBOL_N])
 
 static void serialize_frame(const modem_frame_t *frame, uint8_t raw[RAW_N])
 {
+    size_t content_length;
     uint32_t crc;
 
     memset(raw, 0, RAW_N);
@@ -203,8 +207,9 @@ static void serialize_frame(const modem_frame_t *frame, uint8_t raw[RAW_N])
     put_u16(raw + 18, frame->payload_len);
     if (frame->payload_len <= MODEM_PAYLOAD_MAX)
         memcpy(raw + HEADER_N, frame->payload, frame->payload_len);
-    crc = crc32(raw, RAW_N - 4u);
-    put_u32(raw + RAW_N - 4u, crc);
+    content_length = HEADER_N + frame->payload_len;
+    crc = crc32(raw, content_length);
+    put_u32(raw + content_length, crc);
 }
 
 static int parse_frame(const uint8_t raw[RAW_N], modem_frame_t *frame)
@@ -212,11 +217,12 @@ static int parse_frame(const uint8_t raw[RAW_N], modem_frame_t *frame)
     uint16_t payload_len;
 
     if (raw[0] != 0xa7 || raw[1] != 0x3c || raw[2] != 1 ||
-        raw[3] < MODEM_HELLO || raw[3] > MODEM_RESPONSE ||
-        get_u32(raw + RAW_N - 4u) != crc32(raw, RAW_N - 4u))
+        raw[3] < MODEM_HELLO || raw[3] > MODEM_RESPONSE)
         return -1;
     payload_len = get_u16(raw + 18);
-    if (payload_len > MODEM_PAYLOAD_MAX)
+    if (payload_len > MODEM_PAYLOAD_MAX ||
+        get_u32(raw + HEADER_N + payload_len) !=
+            crc32(raw, HEADER_N + payload_len))
         return -1;
     memset(frame, 0, sizeof(*frame));
     frame->type = raw[3];
@@ -405,6 +411,7 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
     float llr[CODE_BITS];
     uint8_t raw[RAW_N];
     size_t llr_pos = 0;
+    long sample_adjustment = 0;
     unsigned training_index, symbol, k;
 
     memset(channel, 0, sizeof(channel));
@@ -421,17 +428,43 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
 
     for (symbol = 0; symbol < band->symbols; ++symbol) {
         double complex time[FFT_N];
+        double complex slope_sum = 0.0;
         double complex phase_sum = 0.0;
         double complex rotation;
-        size_t base = start + 2u * SYMBOL_N + symbol * SYMBOL_N + CP_N;
+        double timing = 0.0;
+        double complex previous_pilot = 0.0;
+        int have_previous_pilot = 0;
+        size_t base = start + 2u * SYMBOL_N + symbol * SYMBOL_N + CP_N +
+                      sample_adjustment;
         unsigned i;
 
         for (i = 0; i < FFT_N; ++i)
             time[i] = decoder->rx[base + i];
         fft(time, 0);
         for (k = band->low_bin; k <= band->high_bin; ++k) {
-            if (is_pilot(band, k) && cabs(channel[k]) > 1.0e-8)
-                phase_sum += time[k] / channel[k] * pn_value(k, symbol + 1u);
+            double complex pilot;
+            double magnitude;
+            if (!is_pilot(band, k) || cabs(channel[k]) <= 1.0e-8)
+                continue;
+            pilot = time[k] / channel[k] * pn_value(k, symbol + 1u);
+            if (have_previous_pilot) {
+                double complex difference = pilot * conj(previous_pilot);
+                magnitude = cabs(difference);
+                if (magnitude > 1.0e-8)
+                    slope_sum += difference / magnitude;
+            }
+            previous_pilot = pilot;
+            have_previous_pilot = 1;
+        }
+        if (cabs(slope_sum) > 1.0e-8)
+            timing = -carg(slope_sum) * FFT_N / (2.0 * PI * 8.0);
+        for (k = band->low_bin; k <= band->high_bin; ++k) {
+            if (is_pilot(band, k) && cabs(channel[k]) > 1.0e-8) {
+                double angle = 2.0 * PI * k * timing / FFT_N;
+                phase_sum += time[k] / channel[k] *
+                             (cos(angle) + I * sin(angle)) *
+                             pn_value(k, symbol + 1u);
+            }
         }
         rotation = cabs(phase_sum) > 1.0e-8
                        ? conj(phase_sum) / cabs(phase_sum)
@@ -443,14 +476,24 @@ static int decode_at(const modem_decoder_t *decoder, size_t start,
                 continue;
             if (cabs(channel[k]) < 1.0e-8)
                 value = 0.0;
-            else
-                value = time[k] / channel[k] * rotation;
+            else {
+                double angle = 2.0 * PI * k * timing / FFT_N;
+                value = time[k] / channel[k] *
+                        (cos(angle) + I * sin(angle)) * rotation;
+            }
             x = creal(value) * sqrt(10.0);
             y = cimag(value) * sqrt(10.0);
             llr[llr_pos++] = (float)x;
             llr[llr_pos++] = (float)(2.0 - fabs(x));
             llr[llr_pos++] = (float)y;
             llr[llr_pos++] = (float)(2.0 - fabs(y));
+        }
+        if (timing <= -0.5 || timing >= 0.5) {
+            sample_adjustment += lround(timing);
+            if (sample_adjustment < -(long)DETECT_LOOKAHEAD)
+                sample_adjustment = -(long)DETECT_LOOKAHEAD;
+            if (sample_adjustment > (long)DETECT_LOOKAHEAD)
+                sample_adjustment = (long)DETECT_LOOKAHEAD;
         }
     }
     if (llr_pos != CODE_BITS || convolutional_decode(llr, raw) != 0)
@@ -491,6 +534,22 @@ int modem_decoder_set_band(modem_decoder_t *decoder, unsigned low_hz,
     decoder->length = 0;
     decoder->search_position = 0;
     return 0;
+}
+
+void modem_decoder_take_activity(modem_decoder_t *decoder,
+                                 modem_activity_t *activity)
+{
+    if (!activity)
+        return;
+    memset(activity, 0, sizeof(*activity));
+    if (!decoder)
+        return;
+    activity->peak_sync = decoder->peak_sync;
+    activity->candidates = decoder->candidates;
+    activity->rejected = decoder->rejected;
+    decoder->peak_sync = 0.0;
+    decoder->candidates = 0;
+    decoder->rejected = 0;
 }
 
 static void discard_samples(modem_decoder_t *decoder, size_t count)
@@ -539,11 +598,15 @@ int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
     for (i = decoder->search_position; i <= max_start; ++i) {
         double first = correlation(training, decoder->rx + i, SYMBOL_N);
         double score;
+        if (first > decoder->peak_sync)
+            decoder->peak_sync = first;
         if (first < 0.20)
             continue;
         score = (first + correlation(training, decoder->rx + i + SYMBOL_N,
                                      SYMBOL_N)) /
                 2.0;
+        if (score > decoder->peak_sync)
+            decoder->peak_sync = score;
         if (score > best) {
             best = score;
             best_start = i;
@@ -552,9 +615,11 @@ int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
     decoder->search_position = max_start + 1u;
     if (best >= 0.55) {
         int result = decode_at(decoder, best_start, frame);
+        ++decoder->candidates;
         discard_samples(decoder, best_start + needed);
         if (result == 0)
             return 1;
+        ++decoder->rejected;
         return 0;
     }
     if (decoder->length > needed + AUDIO_SAMPLE_RATE)
@@ -634,6 +699,78 @@ static int test_one_band(unsigned low, unsigned high)
     return 0;
 }
 
+static int test_clock_mismatch(double ratio)
+{
+    modem_frame_t sent, received;
+    modem_decoder_t *decoder = NULL;
+    float *encoded = NULL, *channel = NULL;
+    size_t encoded_count = 0, resampled_count, channel_count, i, position;
+    uint32_t random = 23;
+    int got = 0;
+
+    memset(&sent, 0, sizeof(sent));
+    sent.type = MODEM_REQUEST;
+    sent.session = 0x31415926u;
+    sent.seq = 73;
+    sent.band_low = MODEM_MIN_HZ;
+    sent.band_high = MODEM_MAX_HZ;
+    sent.payload_len = MODEM_PAYLOAD_MAX;
+    for (i = 0; i < sent.payload_len; ++i)
+        sent.payload[i] = (uint8_t)test_random(&random);
+    if (modem_encode(&sent, MODEM_MIN_HZ, MODEM_MAX_HZ, &encoded,
+                     &encoded_count) != 0)
+        goto done;
+    resampled_count = (size_t)(encoded_count * ratio);
+    channel_count = 137u + resampled_count + 17u + 257u;
+    channel = calloc(channel_count, sizeof(*channel));
+    decoder = modem_decoder_create(MODEM_MIN_HZ, MODEM_MAX_HZ);
+    if (!channel || !decoder)
+        goto done;
+    for (i = 0; i < channel_count; ++i) {
+        double noise = ((int)(test_random(&random) >> 16) - 32768) / 32768.0;
+        channel[i] = (float)(noise * 0.004);
+    }
+    for (i = 0; i < resampled_count; ++i) {
+        double source = i / ratio;
+        size_t index = (size_t)source;
+        double fraction = source - index;
+        float sample = index + 1u < encoded_count
+                           ? (float)(encoded[index] * (1.0 - fraction) +
+                                     encoded[index + 1u] * fraction)
+                           : 0.0f;
+        channel[137u + i] += sample * 0.43f;
+        channel[137u + i + 17u] += sample * 0.09f;
+    }
+    for (position = 0; position < channel_count && !got;) {
+        size_t chunk = channel_count - position;
+        int result;
+        if (chunk > 173u)
+            chunk = 173u;
+        result = modem_decoder_feed(decoder, channel + position, chunk,
+                                    &received);
+        if (result < 0)
+            break;
+        got = result;
+        position += chunk;
+    }
+    if (got && received.type == sent.type &&
+        received.session == sent.session && received.seq == sent.seq &&
+        received.payload_len == sent.payload_len &&
+        memcmp(received.payload, sent.payload, sent.payload_len) == 0) {
+        free(channel);
+        modem_free_samples(encoded);
+        modem_decoder_destroy(decoder);
+        return 0;
+    }
+done:
+    free(channel);
+    modem_free_samples(encoded);
+    modem_decoder_destroy(decoder);
+    fprintf(stderr, "modem clock-mismatch self-test failed at %.0f ppm\n",
+            (ratio - 1.0) * 1000000.0);
+    return -1;
+}
+
 static int test_frame_stream(void)
 {
     modem_frame_t sent[2], received;
@@ -700,7 +837,9 @@ done:
 int modem_self_test(void)
 {
     if (test_one_band(MODEM_MIN_HZ, MODEM_MAX_HZ) != 0 ||
-        test_one_band(3500u, 8500u) != 0 || test_frame_stream() != 0)
+        test_one_band(3500u, 8500u) != 0 ||
+        test_clock_mismatch(0.998) != 0 ||
+        test_clock_mismatch(1.002) != 0 || test_frame_stream() != 0)
         return -1;
     return 0;
 }
