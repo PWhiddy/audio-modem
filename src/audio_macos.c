@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RING_N (AUDIO_SAMPLE_RATE * 40u)
+#define RING_N (AUDIO_SAMPLE_RATE * 48u)
 #define BLOCK_N 256u
 #define QUEUE_BUFFERS 3u
 

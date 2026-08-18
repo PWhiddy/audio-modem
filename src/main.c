@@ -84,6 +84,7 @@ typedef struct {
     double input_square_sum;
     float input_peak;
     uint64_t input_samples;
+    uint64_t muted_input_samples;
     uint64_t next_audio_status;
     uint64_t ignore_input_until;
 } app_t;
@@ -749,8 +750,10 @@ static void pump_audio(app_t *app)
     while ((count = audio_read(app->audio, samples,
                                sizeof(samples) / sizeof(samples[0]))) != 0) {
         size_t i;
-        if (milliseconds() < app->ignore_input_until)
+        if (milliseconds() < app->ignore_input_until) {
+            app->muted_input_samples += count;
             continue;
+        }
         for (i = 0; i < count; ++i) {
             float absolute = fabsf(samples[i]);
             app->input_square_sum += (double)samples[i] * samples[i];
@@ -779,6 +782,10 @@ static void maybe_log_audio_status(app_t *app, uint64_t now)
             activity.peak_sync = link_activity.peak_sync;
         activity.candidates += link_activity.candidates;
         activity.rejected += link_activity.rejected;
+        activity.timing_rejected += link_activity.timing_rejected;
+        activity.sync_rejected += link_activity.sync_rejected;
+        activity.pilot_rejected += link_activity.pilot_rejected;
+        activity.payload_rejected += link_activity.payload_rejected;
     }
     connecting = app->options.gateway
                      ? app->gateway_state != GATEWAY_CONNECTED
@@ -798,10 +805,20 @@ static void maybe_log_audio_status(app_t *app, uint64_t now)
             double peak_db = 20.0 * log10(app->input_peak > 1.0e-6f
                                               ? app->input_peak
                                               : 1.0e-6f);
+            if (activity.rejected)
+                log_line(app,
+                         "input level: %.0f dBFS RMS, %.0f dBFS peak; best modem sync %.2f; rejected %u candidate(s): timing %u, sync %u, pilot %u, payload/CRC %u",
+                         rms_db, peak_db, activity.peak_sync,
+                         activity.rejected, activity.timing_rejected,
+                         activity.sync_rejected, activity.pilot_rejected,
+                         activity.payload_rejected);
+            else
+                log_line(app,
+                         "input level: %.0f dBFS RMS, %.0f dBFS peak; best modem sync %.2f",
+                         rms_db, peak_db, activity.peak_sync);
+        } else if (app->muted_input_samples) {
             log_line(app,
-                     "input level: %.0f dBFS RMS, %.0f dBFS peak; best modem sync %.2f%s",
-                     rms_db, peak_db, activity.peak_sync,
-                     activity.rejected ? "; candidate frame rejected" : "");
+                     "local transmit active; microphone decoding temporarily muted");
         } else {
             log_line(app, "audio input produced no samples");
         }
@@ -809,6 +826,7 @@ static void maybe_log_audio_status(app_t *app, uint64_t now)
     app->input_square_sum = 0.0;
     app->input_peak = 0.0f;
     app->input_samples = 0;
+    app->muted_input_samples = 0;
 }
 
 static void pump_tunnel(app_t *app)

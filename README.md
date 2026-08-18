@@ -62,10 +62,14 @@ microphone, and the gateway speaker must reach the client microphone. While a
 side is waiting for the handshake or a linked response, it reports its input
 RMS/peak level and best modem-sync score every five seconds. A score near zero
 means the selected microphone is not hearing a recognizable burst. A score
-approaching `0.55` means the burst is recognizable; `candidate frame rejected`
-means it found the CSS preamble but the frame was too damaged to pass error
-correction and CRC. Move the relevant microphone closer or adjust output/input
-gain, while avoiding peaks near 0 dBFS because those indicate clipping.
+approaching `0.55` means the burst is recognizable; a `rejected` candidate
+means it found the CSS preamble but could not recover an exact frame. Move the
+relevant microphone closer or adjust output/input gain, while avoiding peaks
+near 0 dBFS because those indicate clipping.
+Rejected-frame reports break failures down into `timing`, `sync`, `pilot`, and
+`payload/CRC`, which makes it clear whether acquisition or data integrity is
+the limiting stage. During local playback, microphone decoding is intentionally
+muted and logged as such rather than reported as missing input samples.
 
 ## Options
 
@@ -109,7 +113,7 @@ privileges.
   in the deliberately slow `safe` profile (SF10 and 16-byte acoustic
   fragments), then advances after eight clean data transactions through
   `robust` (SF9/32), `balanced` (SF8/64), and `fast` (SF7/96).
-- Payload shifts use every fourth CSS bin. The guard bins absorb the small
+- Payload shifts use every eighth CSS bin. The guard bins absorb the small
   peak shifts caused by speaker response, room echoes, and sample timing while
   still letting lower spreading factors increase useful throughput.
 - A missed response immediately requests the next higher spreading factor and

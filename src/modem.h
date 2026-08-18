@@ -47,6 +47,10 @@ typedef struct {
     double peak_sync;
     unsigned candidates;
     unsigned rejected;
+    unsigned timing_rejected;
+    unsigned sync_rejected;
+    unsigned pilot_rejected;
+    unsigned payload_rejected;
 } modem_activity_t;
 
 modem_decoder_t *modem_decoder_create(unsigned low_hz, unsigned high_hz);

@@ -22,10 +22,10 @@
 #define CORRELATION_POINTS 160u
 #define MIX_FILTER_TAPS 65u
 #define OUTPUT_FILTER_TAPS 97u
-#define RX_CAPACITY (AUDIO_SAMPLE_RATE * 40u)
+#define RX_CAPACITY (AUDIO_SAMPLE_RATE * 48u)
 #define CSS_MAX_SF 10u
 #define CSS_MIN_SF 7u
-#define CSS_GUARD_BITS 2u
+#define CSS_GUARD_BITS 3u
 #define CSS_MAX_M (1u << CSS_MAX_SF)
 #define SYNC_CONTROL 64u
 #define SYNC_DATA_BASE 192u
@@ -50,6 +50,10 @@ struct modem_decoder {
     double peak_sync;
     unsigned candidates;
     unsigned rejected;
+    unsigned timing_rejected;
+    unsigned sync_rejected;
+    unsigned pilot_rejected;
+    unsigned payload_rejected;
     int pending;
     size_t pending_start;
     double pending_span;
@@ -802,7 +806,7 @@ static void spectrum_llrs(const double power[CSS_MAX_M], unsigned sf,
         int neighbor;
 
         candidate_power = power[candidate];
-        for (neighbor = -1; neighbor <= 1; neighbor += 2) {
+        for (neighbor = -3; neighbor <= 3; ++neighbor) {
             unsigned observed =
                 (unsigned)((long)candidate + neighbor) & (m - 1u);
             if (power[observed] > candidate_power)
@@ -861,10 +865,14 @@ static int decode_pending(modem_decoder_t *decoder, modem_frame_t *frame)
             observed_span > body_span * 1.03 ||
             css_spectrum(decoder, boundary, observed_span, sf, power,
                          &peak, &quality) != 0 ||
-            quality < 2.0)
+            quality < 2.0) {
+            ++decoder->pilot_rejected;
             return -1;
-        if (circular_distance(peak, body_pilot_value(sf), 1u << sf) > 2u)
+        }
+        if (circular_distance(peak, body_pilot_value(sf), 1u << sf) > 3u) {
+            ++decoder->pilot_rejected;
             return -1;
+        }
         boundary = next_boundary;
     }
     for (symbol = 0; symbol < symbol_count; ++symbol) {
@@ -882,6 +890,7 @@ static int decode_pending(modem_decoder_t *decoder, modem_frame_t *frame)
             css_spectrum(decoder, boundary, observed_span, sf, power,
                          &peak, &quality) != 0 ||
             quality < 1.8) {
+            ++decoder->payload_rejected;
             return -1;
         }
         (void)peak;
@@ -893,9 +902,15 @@ static int decode_pending(modem_decoder_t *decoder, modem_frame_t *frame)
         }
         boundary = next_boundary;
     }
-    if (convolutional_decode(llr, decoder->pending_raw_length, raw) != 0)
+    if (convolutional_decode(llr, decoder->pending_raw_length, raw) != 0) {
+        ++decoder->payload_rejected;
         return -1;
-    return parse_frame(raw, decoder->pending_raw_length, frame);
+    }
+    if (parse_frame(raw, decoder->pending_raw_length, frame) != 0) {
+        ++decoder->payload_rejected;
+        return -1;
+    }
+    return 0;
 }
 
 modem_decoder_t *modem_decoder_create(unsigned low_hz, unsigned high_hz)
@@ -959,9 +974,17 @@ void modem_decoder_take_activity(modem_decoder_t *decoder,
     activity->peak_sync = decoder->peak_sync;
     activity->candidates = decoder->candidates;
     activity->rejected = decoder->rejected;
+    activity->timing_rejected = decoder->timing_rejected;
+    activity->sync_rejected = decoder->sync_rejected;
+    activity->pilot_rejected = decoder->pilot_rejected;
+    activity->payload_rejected = decoder->payload_rejected;
     decoder->peak_sync = 0.0;
     decoder->candidates = 0;
     decoder->rejected = 0;
+    decoder->timing_rejected = 0;
+    decoder->sync_rejected = 0;
+    decoder->pilot_rejected = 0;
+    decoder->payload_rejected = 0;
 }
 
 static void discard_samples(modem_decoder_t *decoder, size_t count)
@@ -1068,9 +1091,15 @@ int modem_decoder_feed(modem_decoder_t *decoder, const float *samples,
 
             ++decoder->candidates;
             if (acquire_preamble(decoder, best_start, &start, &span,
-                                 &score) != 0 ||
-                decode_sync(decoder, start, span, &profile,
+                                 &score) != 0) {
+                ++decoder->timing_rejected;
+                ++decoder->rejected;
+                discard_samples(decoder, best_start + scan_step);
+                continue;
+            }
+            if (decode_sync(decoder, start, span, &profile,
                             &raw_length) != 0) {
+                ++decoder->sync_rejected;
                 ++decoder->rejected;
                 discard_samples(decoder, best_start + scan_step);
                 continue;
@@ -1132,7 +1161,7 @@ static int test_channel(unsigned low, unsigned high,
     if (modem_encode(&sent, low, high, profile, &encoded, &encoded_count) != 0)
         goto done;
     resampled_count = (size_t)(encoded_count * ratio);
-    channel_count = 137u + resampled_count + 31u + 1024u;
+    channel_count = 137u + resampled_count + 911u + 1024u;
     channel = calloc(channel_count, sizeof(*channel));
     decoder = modem_decoder_create(low, high);
     if (!channel || !decoder ||
@@ -1150,8 +1179,10 @@ static int test_channel(unsigned low, unsigned high,
                            ? (float)(encoded[index] * (1.0 - fraction) +
                                      encoded[index + 1u] * fraction)
                            : 0.0f;
-        channel[137u + i] += sample * 0.43f;
-        channel[137u + i + 31u] += sample * 0.07f;
+        channel[137u + i] += sample * 0.38f;
+        channel[137u + i + 31u] += sample * 0.06f;
+        channel[137u + i + 347u] += sample * 0.08f;
+        channel[137u + i + 911u] -= sample * 0.04f;
     }
     for (position = 0; position < channel_count && !got;) {
         size_t chunk = channel_count - position;
