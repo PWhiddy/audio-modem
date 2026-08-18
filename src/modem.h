@@ -6,8 +6,9 @@
 
 #define MODEM_MIN_HZ 2000u
 #define MODEM_MAX_HZ 12000u
-#define MODEM_BOOTSTRAP_MAX_HZ 6000u
-#define MODEM_DEFAULT_MAX_HZ 6000u
+#define MODEM_BOOTSTRAP_MAX_HZ 12000u
+#define MODEM_DEFAULT_MAX_HZ 12000u
+#define MODEM_MIN_BANDWIDTH_HZ 4000u
 #define MODEM_PAYLOAD_MAX 96u
 
 enum modem_profile {
@@ -66,7 +67,7 @@ int modem_encode(const modem_frame_t *frame, unsigned low_hz, unsigned high_hz,
 size_t modem_burst_samples(unsigned low_hz, unsigned high_hz,
                            enum modem_profile profile);
 size_t modem_profile_payload_limit(enum modem_profile profile);
-unsigned modem_profile_repetitions(enum modem_profile profile);
+unsigned modem_profile_spreading_factor(enum modem_profile profile);
 void modem_free_samples(float *samples);
 
 /* Deterministic DSP/codec tests, with diagnostic output on failure. */

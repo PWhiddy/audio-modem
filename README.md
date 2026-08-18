@@ -53,7 +53,9 @@ connection without IPv6 will naturally only provide working IPv4 service.
 The program logs its selected input and output devices, tunnel configuration,
 connection handshake, negotiated audio band, link transitions, retries,
 adaptive data profile, and acknowledged upload/download bytes per second.
-Routine idle polls are intentionally not logged.
+Startup also reports the deliberately long SF10 burst and retry timing so an
+initial robust transmission is not mistaken for a stalled process. Routine
+idle polls are intentionally not logged.
 
 The acoustic path is bidirectional: the client speaker must reach the gateway
 microphone, and the gateway speaker must reach the client microphone. While a
@@ -61,7 +63,7 @@ side is waiting for the handshake or a linked response, it reports its input
 RMS/peak level and best modem-sync score every five seconds. A score near zero
 means the selected microphone is not hearing a recognizable burst. A score
 approaching `0.55` means the burst is recognizable; `candidate frame rejected`
-means it found the OFDM preamble but the frame was too damaged to pass error
+means it found the CSS preamble but the frame was too damaged to pass error
 correction and CRC. Move the relevant microphone closer or adjust output/input
 gain, while avoiding peaks near 0 dBFS because those indicate clipping.
 
@@ -70,13 +72,17 @@ gain, while avoiding peaks near 0 dBFS because those indicate clipping.
 ```text
 --client              run as the client (default)
 --gateway             run as the internet gateway
---band LOW:HIGH       requested band in Hz (default 2000:6000)
+--band LOW:HIGH       requested band in Hz (default 2000:12000)
 --input DEVICE        ALSA device name or CoreAudio device UID
 --output DEVICE       ALSA device name or CoreAudio device UID
 --no-config           do not install addresses, routes, forwarding, or NAT
 --self-test           test the codec without audio hardware or root
 --help                show command help
 ```
+
+The selected band must be at least 4 kHz wide. This keeps the longest SF10
+burst within the bounded audio buffers; the 2-12 kHz default gives the modem
+the largest processing bandwidth and is recommended.
 
 On Linux, `arecord -L` and `aplay -L` list usable ALSA names. The startup log
 resolves the selected PCM to its backing card/device when ALSA exposes that
@@ -89,7 +95,7 @@ while retaining the privileges needed for TUN and network setup; no PulseAudio
 environment variables need to be passed through `sudo`. The defaults are
 normally best on both platforms. The client and gateway may request different
 bands; the handshake selects their overlap. Initial discovery and handshake
-use a fixed, robust 2-6 kHz bootstrap band.
+use a fixed, robust 2-12 kHz bootstrap band.
 
 `--no-config` is intended for development and custom network setups. It still
 creates the TUN/utun device and therefore normally still requires elevated
@@ -97,19 +103,23 @@ privileges.
 
 ## How it works
 
-- 48 kHz mono audio, with active OFDM carriers inside the negotiated 2-12 kHz
-  range.
-- Repeated-BPSK data carriers, BPSK pilots and training symbols, cyclic prefixes,
-  and per-burst channel/phase estimation. Pilot tracking compensates for small
-  sample-clock differences between independent audio devices.
-- Discovery, handshake, and profile-control bits are repeated eight times. Data
-  starts in a deliberately slow `safe` profile (8x repetition and 16-byte
-  acoustic fragments), then advances after four clean data transactions through
-  `robust` (4x/32), `balanced` (3x/64), and `fast` (2x/96).
-- A missed response immediately requests the next safer profile over the 8x
-  control channel and retransmits the in-flight fragment without dropping the
-  tunnel. Lost profile acknowledgements are themselves retransmitted.
-- Rate-1/2 convolutional error correction and CRC-32 reject damaged frames.
+- 48 kHz mono audio using chirp spread spectrum (CSS) inside the negotiated
+  range. The default and bootstrap band is 2-12 kHz.
+- Discovery, handshake, and profile-control frames use SF10. Data also starts
+  in the deliberately slow `safe` profile (SF10 and 16-byte acoustic
+  fragments), then advances after eight clean data transactions through
+  `robust` (SF9/32), `balanced` (SF8/64), and `fast` (SF7/96).
+- Payload shifts use every fourth CSS bin. The guard bins absorb the small
+  peak shifts caused by speaker response, room echoes, and sample timing while
+  still letting lower spreading factors increase useful throughput.
+- A missed response immediately requests the next higher spreading factor and
+  retransmits the in-flight fragment without dropping the tunnel. Lost profile
+  acknowledgements are themselves retransmitted.
+- Rate-1/3 convolutional error correction repairs damaged symbols, while
+  CRC-32 rejects any frame that is still not exact.
+- Preamble timing and sample-clock estimation accommodate independent audio
+  clocks. Each chirp is tapered and the completed burst is band-limited before
+  playback to avoid sharp-boundary clicks and out-of-band crackle.
 - Short, numbered link transactions provide bounded retransmission for all IP
   protocols, including UDP and ICMP—not only TCP.
 - IP packets up to the 1280-byte tunnel MTU are fragmented across audio frames
@@ -160,9 +170,10 @@ path.
   dependency-free.
 - Networking uses TUN on Linux and utun on macOS. After automatic setup, normal
   client network traffic is routed through the gateway.
-- The link starts with 8x repeated BPSK and 16-byte frames in the 2-6 kHz default
-  band at a 48 kHz sample rate. It increases data density only after clean
-  acknowledged transfers and falls back as soon as a transaction is missed.
+- The link starts with SF10 CSS and 16-byte frames in the 2-12 kHz default band
+  at a 48 kHz sample rate. It walks down through SF9, SF8, and SF7 only after
+  clean acknowledged transfers and falls back as soon as a transaction is
+  missed.
 - The initial implementation supports one client per gateway.
 - The initial link is unauthenticated and unencrypted.
 - Startup and operation log the selected input/output audio devices and useful

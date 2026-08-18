@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RING_N (AUDIO_SAMPLE_RATE * 4u)
+#define RING_N (AUDIO_SAMPLE_RATE * 40u)
 #define BLOCK_N 256u
 #define PCM_PLAYBACK 0
 #define PCM_CAPTURE 1
