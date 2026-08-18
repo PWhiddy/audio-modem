@@ -21,6 +21,8 @@
 #define SEARCH_MS 3000u
 #define IDLE_POLL_MS 1000u
 #define LINK_TIMEOUT_MS 12000u
+#define TURNAROUND_MS 150u
+#define OUTPUT_TAIL_MS 100u
 
 enum client_state { CLIENT_SEARCH, CLIENT_WAIT_READY, CLIENT_READY,
                     CLIENT_WAIT_RESPONSE };
@@ -70,6 +72,7 @@ typedef struct {
     float input_peak;
     uint64_t input_samples;
     uint64_t next_audio_status;
+    uint64_t ignore_input_until;
 } app_t;
 
 static volatile sig_atomic_t stopping;
@@ -194,6 +197,9 @@ static int send_frame(app_t *app, const modem_frame_t *frame, int bootstrap)
     float *samples = NULL;
     size_t count = 0;
     char error[256];
+    struct timespec turnaround = {
+        TURNAROUND_MS / 1000u,
+        (long)(TURNAROUND_MS % 1000u) * 1000000L};
     unsigned low = bootstrap ? MODEM_MIN_HZ : app->selected_low;
     unsigned high = bootstrap ? MODEM_MAX_HZ : app->selected_high;
 
@@ -201,11 +207,23 @@ static int send_frame(app_t *app, const modem_frame_t *frame, int bootstrap)
         log_line(app, "cannot encode audio frame");
         return -1;
     }
+    while (nanosleep(&turnaround, &turnaround) != 0 && errno == EINTR &&
+           !stopping)
+        ;
+    if (stopping) {
+        modem_free_samples(samples);
+        return -1;
+    }
     if (audio_send(app->audio, samples, count, error, sizeof(error)) != 0) {
         log_line(app, "%s", error);
         modem_free_samples(samples);
         return -1;
     }
+    app->ignore_input_until =
+        milliseconds() +
+        ((uint64_t)count * 1000u + AUDIO_SAMPLE_RATE - 1u) /
+            AUDIO_SAMPLE_RATE +
+        OUTPUT_TAIL_MS;
     modem_free_samples(samples);
     return 0;
 }
@@ -483,6 +501,8 @@ static void pump_audio(app_t *app)
     while ((count = audio_read(app->audio, samples,
                                sizeof(samples) / sizeof(samples[0]))) != 0) {
         size_t i;
+        if (milliseconds() < app->ignore_input_until)
+            continue;
         for (i = 0; i < count; ++i) {
             float absolute = fabsf(samples[i]);
             app->input_square_sum += (double)samples[i] * samples[i];
@@ -752,6 +772,9 @@ static int run_app(const options_t *options)
     log_line(&app, "audio output: %s", audio_output_name(app.audio));
     log_line(&app,
              "audio format: mono 48 kHz; QPSK OFDM; bootstrap band 2000-12000 Hz");
+    log_line(&app,
+             "half-duplex timing: %u ms turnaround; local transmit echo suppressed",
+             TURNAROUND_MS);
 
     if (tunnel_open(&app.tunnel, options->gateway, options->configure,
                     error, sizeof(error)) != 0) {

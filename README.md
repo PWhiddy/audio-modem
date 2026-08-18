@@ -110,7 +110,8 @@ privileges.
   and reassembled before being written to the peer's tunnel.
 - Client polling makes the half-duplex acoustic channel collision-free and also
   acts as the heartbeat. Four missed responses drop the link and restart
-  discovery.
+  discovery. A short turnaround guard and receive muting during local output
+  keep each machine from decoding its own speaker echo as a peer frame.
 
 The link is designed for reliability and simplicity, not broadband speed.
 Actual throughput and error rate depend heavily on the microphones, speakers,
